@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 from scipy.io.wavfile import write as wav_write
-from pocket_tts import TTSModel, export_model_state, load_model_state
+from pocket_tts import TTSModel, export_model_state
 
 # ── Config ──────────────────────────────────────────────────────────────
 
@@ -64,9 +64,9 @@ def init_tts():
     _tts_model = TTSModel.load_model()
 
     if os.path.exists(VOICE_SAFETENSORS):
-        # Fast path: load pre-exported voice state
+        # Fast path: load pre-exported voice state from safetensors
         print(f"🔊 Loading cloned voice from {VOICE_SAFETENSORS}...", flush=True)
-        _tts_voice_state = load_model_state(VOICE_SAFETENSORS)
+        _tts_voice_state = _tts_model.get_state_for_audio_prompt(VOICE_SAFETENSORS)
         print("🔊 TTS ready (cloned voice).", flush=True)
     elif os.path.exists(VOICE_WAV):
         # First run: export voice state from wav
