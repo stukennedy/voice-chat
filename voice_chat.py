@@ -1,17 +1,17 @@
-# Voice Chat — Local Pipeline
+# Voice Chat — Local Pipeline with Voice Cloning
 #
 # Components:
 #   1. STT:  whisper.cpp (Metal-accelerated) via subprocess
-#   2. LLM:  Ollama (qwen3:8b) via HTTP API
-#   3. TTS:  Pocket-TTS (Python API, int8 quantized)
+#   2. LLM:  Ollama (llama3.2:3b) via HTTP API
+#   3. TTS:  Pocket-TTS (Python API, voice cloning)
 #
 # Pipeline: mic -> whisper.cpp -> ollama -> pocket-tts -> speaker
 #
 # Usage:
 #   uv run voice_chat.py
 #
-# Press Enter to start recording, Enter again to stop and process.
-# Type 'quit' to exit.
+# First run: exports voice state from voices/clone_voice.wav -> voices/clone_voice.safetensors
+# Subsequent runs: loads safetensors directly (fast)
 
 import subprocess
 import json
@@ -19,7 +19,6 @@ import time
 import sys
 import os
 import tempfile
-import wave
 import select
 import tty
 import termios
@@ -30,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 from scipy.io.wavfile import write as wav_write
-from pocket_tts import TTSModel
+from pocket_tts import TTSModel, export_model_state, load_model_state
 
 # ── Config ──────────────────────────────────────────────────────────────
 
@@ -38,9 +37,14 @@ WHISPER_CLI = "/opt/homebrew/bin/whisper-cli"
 WHISPER_MODEL = os.path.expanduser("~/.local/share/whisper-cpp/ggml-base.en.bin")
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "llama3.2:3b"
-TTS_VOICE = "alba"
+
+# Voice cloning: uses safetensors if available, otherwise exports from wav
+VOICE_WAV = str(Path(__file__).parent / "voices" / "clone_voice.wav")
+VOICE_SAFETENSORS = str(Path(__file__).parent / "voices" / "clone_voice.safetensors")
+# Fallback preset voice if clone files don't exist
+TTS_VOICE_FALLBACK = "alba"
+
 SAMPLE_RATE = 16000
-TTS_QUANTIZE = True
 MAX_RECORD_SECONDS = 30
 
 SYSTEM_PROMPT = (
@@ -49,7 +53,7 @@ SYSTEM_PROMPT = (
     "No markdown, no bullet points, just spoken-style responses."
 )
 
-# ── TTS (Pocket-TTS) ────────────────────────────────────────────────────
+# ── TTS (Pocket-TTS with voice cloning) ─────────────────────────────────
 
 _tts_model = None
 _tts_voice_state = None
@@ -58,9 +62,24 @@ def init_tts():
     global _tts_model, _tts_voice_state
     print("🔊 Loading Pocket-TTS model...", flush=True)
     _tts_model = TTSModel.load_model()
-    print(f"🔊 Loading voice '{TTS_VOICE}'...", flush=True)
-    _tts_voice_state = _tts_model.get_state_for_audio_prompt(TTS_VOICE)
-    print("🔊 TTS ready.", flush=True)
+
+    if os.path.exists(VOICE_SAFETENSORS):
+        # Fast path: load pre-exported voice state
+        print(f"🔊 Loading cloned voice from {VOICE_SAFETENSORS}...", flush=True)
+        _tts_voice_state = load_model_state(VOICE_SAFETENSORS)
+        print("🔊 TTS ready (cloned voice).", flush=True)
+    elif os.path.exists(VOICE_WAV):
+        # First run: export voice state from wav
+        print(f"🔊 Exporting voice from {VOICE_WAV}...", flush=True)
+        _tts_voice_state = _tts_model.get_state_for_audio_prompt(VOICE_WAV)
+        export_model_state(_tts_voice_state, VOICE_SAFETENSORS)
+        print(f"🔊 Saved voice state to {VOICE_SAFETENSORS}", flush=True)
+        print("🔊 TTS ready (cloned voice).", flush=True)
+    else:
+        # Fallback: use preset voice
+        print(f"🔊 No voice clone found, using preset '{TTS_VOICE_FALLBACK}'...", flush=True)
+        _tts_voice_state = _tts_model.get_state_for_audio_prompt(TTS_VOICE_FALLBACK)
+        print("🔊 TTS ready (preset voice).", flush=True)
 
 def speak(text: str):
     """Generate audio from text and play it."""
