@@ -1,11 +1,11 @@
-# Voice Chat — Local Pipeline with Voice Cloning
+# Voice Chat — Local Pipeline with Voice Cloning + Streaming TTS
 #
 # Components:
 #   1. STT:  whisper.cpp (Metal-accelerated) via subprocess
-#   2. LLM:  Ollama (llama3.2:3b) via HTTP API
-#   3. TTS:  Pocket-TTS (Python API, voice cloning)
+#   2. LLM:  Ollama (llama3.2:3b) — streamed token-by-token
+#   3. TTS:  Pocket-TTS — sentence-chunked streaming, plays while LLM still generates
 #
-# Pipeline: mic -> whisper.cpp -> ollama -> pocket-tts -> speaker
+# Pipeline: mic -> whisper.cpp -> ollama (stream) -> sentence buffer -> pocket-tts -> speaker
 #
 # Usage:
 #   uv run voice_chat.py
@@ -23,7 +23,9 @@ import select
 import tty
 import termios
 import threading
+import queue
 import urllib.request
+import urllib.parse
 from pathlib import Path
 
 import numpy as np
@@ -38,10 +40,8 @@ WHISPER_MODEL = os.path.expanduser("~/.local/share/whisper-cpp/ggml-base.en.bin"
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "llama3.2:3b"
 
-# Voice cloning: uses safetensors if available, otherwise exports from wav
 VOICE_WAV = str(Path(__file__).parent / "voices" / "clone_voice.wav")
 VOICE_SAFETENSORS = str(Path(__file__).parent / "voices" / "clone_voice.safetensors")
-# Fallback preset voice if clone files don't exist
 TTS_VOICE_FALLBACK = "alba"
 
 SAMPLE_RATE = 16000
@@ -53,7 +53,14 @@ SYSTEM_PROMPT = (
     "No markdown, no bullet points, just spoken-style responses."
 )
 
-# ── TTS (Pocket-TTS with voice cloning) ─────────────────────────────────
+# Sentence chunking: split on these terminators
+SENTENCE_ENDINGS = ".!?;:,\n"
+# Minimum chunk length before we allow a split (avoid tiny fragments)
+MIN_CHUNK_CHARS = 15
+# Max chunk size (forces a split even without punctuation)
+MAX_CHUNK_CHARS = 200
+
+# ── TTS ─────────────────────────────────────────────────────────────────
 
 _tts_model = None
 _tts_voice_state = None
@@ -64,36 +71,182 @@ def init_tts():
     _tts_model = TTSModel.load_model()
 
     if os.path.exists(VOICE_SAFETENSORS):
-        # Fast path: load pre-exported voice state from safetensors
-        print(f"🔊 Loading cloned voice from {VOICE_SAFETENSORS}...", flush=True)
+        print(f"🔊 Loading cloned voice from safetensors...", flush=True)
         _tts_voice_state = _tts_model.get_state_for_audio_prompt(VOICE_SAFETENSORS)
         print("🔊 TTS ready (cloned voice).", flush=True)
     elif os.path.exists(VOICE_WAV):
-        # First run: export voice state from wav
-        print(f"🔊 Exporting voice from {VOICE_WAV}...", flush=True)
+        print(f"🔊 Exporting voice from wav...", flush=True)
         _tts_voice_state = _tts_model.get_state_for_audio_prompt(VOICE_WAV)
         export_model_state(_tts_voice_state, VOICE_SAFETENSORS)
-        print(f"🔊 Saved voice state to {VOICE_SAFETENSORS}", flush=True)
         print("🔊 TTS ready (cloned voice).", flush=True)
     else:
-        # Fallback: use preset voice
-        print(f"🔊 No voice clone found, using preset '{TTS_VOICE_FALLBACK}'...", flush=True)
+        print(f"🔊 Using preset '{TTS_VOICE_FALLBACK}'...", flush=True)
         _tts_voice_state = _tts_model.get_state_for_audio_prompt(TTS_VOICE_FALLBACK)
         print("🔊 TTS ready (preset voice).", flush=True)
 
-def speak(text: str):
-    """Generate audio from text and play it."""
+def generate_speech_chunk(text: str) -> np.ndarray:
+    """Generate audio for a text chunk. Runs in a thread."""
     audio = _tts_model.generate_audio(_tts_voice_state, text)
-    audio_np = audio.numpy()
-    dur = len(audio_np) / _tts_model.sample_rate
-    print(f"  🔊 Playing {dur:.1f}s of audio", flush=True)
+    return audio.numpy()
+
+def play_audio(audio_np: np.ndarray):
+    """Play audio and wait for completion."""
     sd.play(audio_np, _tts_model.sample_rate)
     sd.wait()
 
-# ── STT (whisper.cpp) ───────────────────────────────────────────────────
+# ── Sentence chunker ────────────────────────────────────────────────────
+
+def chunk_sentences(text_stream, on_chunk=None):
+    """
+    Consume text incrementally, yield complete sentence chunks.
+    text_stream: iterable of strings (tokens from LLM stream).
+    Yields (chunk_text, is_final) tuples.
+    """
+    buffer = ""
+    for token in text_stream:
+        buffer += token
+        # Check if we should flush
+        should_flush = False
+
+        # Flush on sentence-ending punctuation (if chunk is long enough)
+        if len(buffer) >= MIN_CHUNK_CHARS:
+            for ending in SENTENCE_ENDINGS:
+                if buffer.rstrip().endswith(ending):
+                    should_flush = True
+                    break
+
+        # Force flush if buffer is too long
+        if len(buffer) >= MAX_CHUNK_CHARS:
+            should_flush = True
+
+        if should_flush:
+            chunk = buffer.strip()
+            buffer = ""
+            if chunk:
+                yield chunk
+
+    # Flush remaining
+    if buffer.strip():
+        yield buffer.strip()
+
+# ── LLM streaming ───────────────────────────────────────────────────────
+
+_ollama_context = []
+
+def stream_llm(prompt: str):
+    """
+    Stream LLM tokens from Ollama. Yields token strings.
+    Updates _ollama_context with the final context.
+    """
+    payload = json.dumps({
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "system": SYSTEM_PROMPT,
+        "stream": True,
+        "context": _ollama_context,
+        "options": {
+            "temperature": 0.7,
+            "num_predict": 200,
+        }
+    }).encode()
+
+    req = urllib.request.Request(
+        OLLAMA_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+
+    full_response = ""
+
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        for line in resp:
+            line = line.decode().strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            token = data.get("response", "")
+            full_response += token
+            if token:
+                yield token
+
+            if data.get("done", False):
+                # Update context for conversation memory
+                ctx = data.get("context", [])
+                if ctx:
+                    _ollama_context.clear()
+                    _ollama_context.extend(ctx)
+                break
+
+def chat_streaming(prompt: str):
+    """
+    Stream LLM output, chunk into sentences, generate TTS in parallel.
+    Plays audio chunks as they're ready — first sentence starts speaking
+    while LLM is still generating the rest.
+    """
+    t0 = time.time()
+    first_audio_played = False
+
+    # Create a token generator
+    token_stream = stream_llm(prompt)
+
+    # Chunk tokens into sentences
+    sentence_stream = chunk_sentences(token_stream)
+
+    # Pipeline: for each sentence chunk, generate TTS in a worker thread
+    # while continuing to consume the LLM stream
+    audio_queue = queue.Queue(maxsize=4)  # limit backlog
+
+    def tts_worker():
+        """Generate TTS for each chunk, push audio to queue."""
+        for chunk in sentence_stream:
+            t_gen = time.time()
+            audio = generate_speech_chunk(chunk)
+            gen_time = time.time() - t_gen
+            dur = len(audio) / _tts_model.sample_rate
+            audio_queue.put((chunk, audio, gen_time, dur))
+
+        # Sentinel: signal end of stream
+        audio_queue.put(None)
+
+    # Start TTS worker thread
+    tts_thread = threading.Thread(target=tts_worker, daemon=True)
+    tts_thread.start()
+
+    # Main thread: play audio chunks as they arrive
+    chunks_played = 0
+    full_text = ""
+
+    while True:
+        item = audio_queue.get(timeout=60)
+        if item is None:
+            break
+
+        chunk, audio, gen_time, dur = item
+        full_text += chunk + " "
+
+        if not first_audio_played:
+            total_ttfb = time.time() - t0
+            print(f"  🎵 First audio: {total_ttfb:.2f}s (chunk: {gen_time:.2f}s gen, {dur:.1f}s audio)", flush=True)
+            first_audio_played = True
+        else:
+            print(f"  🎵 Chunk: {gen_time:.2f}s gen, {dur:.1f}s audio", flush=True)
+
+        # Print the chunk as it's spoken
+        print(f"  💬 \"{chunk}\"", flush=True)
+
+        play_audio(audio)
+        chunks_played += 1
+
+    tts_thread.join(timeout=5)
+
+    total = time.time() - t0
+    print(f"  🧠 Total: {total:.2f}s, {chunks_played} chunks", flush=True)
+
+    return full_text.strip()
+
+# ── STT ────────────────────────────────────────────────────────────────
 
 def record_audio() -> str:
-    """Record audio from mic, save to temp wav, return path."""
     print("🎙️  Recording... (press Enter to stop)", flush=True)
 
     recording = []
@@ -134,7 +287,6 @@ def record_audio() -> str:
     return tmp.name
 
 def transcribe(audio_path: str) -> str:
-    """Run whisper.cpp on the audio file, return transcript."""
     cmd = [
         WHISPER_CLI,
         "-m", WHISPER_MODEL,
@@ -150,54 +302,20 @@ def transcribe(audio_path: str) -> str:
     lines = [l for l in text.split("\n") if l.strip() and not l.startswith("whisper_")]
     return " ".join(lines).strip()
 
-# ── LLM (Ollama) ───────────────────────────────────────────────────────
-
-_ollama_context = []
-
-def chat(prompt: str) -> str:
-    """Send prompt to Ollama, return response text."""
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "system": SYSTEM_PROMPT,
-        "stream": False,
-        "context": _ollama_context,
-        "options": {
-            "temperature": 0.7,
-            "num_predict": 150,
-        }
-    }
-
-    req = urllib.request.Request(
-        OLLAMA_URL,
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    t0 = time.time()
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read())
-
-    elapsed = time.time() - t0
-    text = data.get("response", "").strip()
-    _ollama_context.extend(data.get("context", []))
-
-    print(f"  🧠 LLM responded in {elapsed:.2f}s ({len(text)} chars)", flush=True)
-    return text
-
-# ── Main Loop ──────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────
 
 def main():
     print()
-    print("╔══════════════════════════════════════════╗")
-    print("║   🦊 Local Voice Chat (fully offline)    ║")
-    print("╠══════════════════════════════════════════╣")
-    print("║  Press Enter to talk, type 'quit' to exit ║")
-    print("╚══════════════════════════════════════════╝")
+    print("╔══════════════════════════════════════════════╗")
+    print("║   🦊 Local Voice Chat (streaming, offline)   ║")
+    print("╠══════════════════════════════════════════════╣")
+    print("║  Press Enter to talk, type 'quit' to exit     ║")
+    print("╚══════════════════════════════════════════════╝")
     print()
 
     init_tts()
 
-    # Check ollama is running
+    # Ensure Ollama is running
     try:
         urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2)
     except Exception:
@@ -226,10 +344,9 @@ def main():
                     print("  (empty transcript, skipping)")
                     continue
 
-            response = chat(user_text)
-            print(f"  💬 Response: \"{response}\"", flush=True)
-
-            speak(response)
+            # Stream LLM → chunk → TTS (plays while generating)
+            print("  🧠 Thinking + speaking...", flush=True)
+            chat_streaming(user_text)
 
             turn += 1
 
@@ -238,6 +355,8 @@ def main():
             break
         except Exception as e:
             print(f"  ❌ Error: {e}")
+            import traceback
+            traceback.print_exc()
             continue
 
 if __name__ == "__main__":
