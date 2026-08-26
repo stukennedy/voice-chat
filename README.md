@@ -202,6 +202,8 @@ Edit `voice_chat.py` to change:
 | `PRESET_VOICE` | per-language | Fallback voice when no clone is available |
 | `DEFAULT_LANGUAGE` | `en` | Used for typed input and unsupported detections |
 | `MAX_RECORD_SECONDS` | `30` | Max recording length |
+| `SENTENCE_ENDINGS` | `.!?` | Where chunks split; `,;:` are excluded on purpose (see below) |
+| `TTS_TARGET_RMS` | `0.06` | Loudness every chunk is matched to |
 | `SYSTEM_PROMPT` | concise conversational | Edit to change LLM personality |
 
 ## Performance (M4 Mac mini, 16GB)
@@ -227,6 +229,19 @@ after the first sentence the LLM always has slack. Measured time to first senten
 for `llama3.2:3b` against 0.26s for `qwen2.5:7b` — an 80ms difference. Using a separate model
 per language would trade that 80ms for a 30–60s model eviction and reload the first time you
 switch language, so the pipeline uses one model throughout.
+
+### Chunking and loudness
+
+The LLM's output is split into chunks and spoken as it streams. Two details matter:
+
+- **Chunks split on `.!?` only.** Pocket-TTS renders each chunk as a complete utterance
+  with sentence-final prosody, so splitting on commas put a 5–7dB fade on every comma —
+  audible as the voice dipping mid-sentence. The one exception is the *first* chunk of a
+  response, which may also split on `,;:` so speech starts promptly when the opening
+  sentence is long. After that, playback outpaces generation and there's nothing to gain.
+- **Chunks are loudness-matched.** Generated independently, chunk level varied by up to
+  12dB. Each is now normalised to `TTS_TARGET_RMS`, measured over voiced samples only so
+  a chunk padded with silence isn't amplified to compensate.
 
 ## Architecture
 

@@ -102,12 +102,25 @@ SYSTEM_PROMPT = (
     "No markdown, no bullet points, just spoken-style responses."
 )
 
-# Sentence chunking: split on these terminators
-SENTENCE_ENDINGS = ".!?;:,\n"
+# Sentence chunking: split on these terminators.
+# Deliberately excludes , ; : — Pocket-TTS renders every chunk as a complete utterance
+# with sentence-final prosody, so splitting mid-clause put a 5-7dB fade on every comma.
+SENTENCE_ENDINGS = ".!?\n"
+# The FIRST chunk of a response may also split here, so speech starts promptly even when
+# the opening sentence is long. Once audio is playing, playback outpaces generation and
+# there is no reason to split mid-clause any more.
+FIRST_CHUNK_ENDINGS = ",;:"
 # Minimum chunk length before we allow a split (avoid tiny fragments)
 MIN_CHUNK_CHARS = 15
 # Max chunk size (forces a split even without punctuation)
 MAX_CHUNK_CHARS = 200
+
+# Per-chunk loudness matching. Target is roughly the level Pocket-TTS already averages,
+# so this evens chunks out rather than making the voice louder overall.
+TTS_TARGET_RMS = 0.06
+TTS_MAX_GAIN = 4.0
+TTS_SILENCE_FLOOR = 0.01
+TTS_TRIM_PAD_MS = 40
 
 # ── Language helpers ────────────────────────────────────────────────────
 
@@ -184,10 +197,42 @@ def init_tts(lang_code: str):
     _tts_voice_state = _resolve_voice_state(tts_lang)
     print(f"🔊 TTS ready — {language_name(lang_code)} ({time.time() - t0:.1f}s).", flush=True)
 
+def normalize_chunk(audio: np.ndarray) -> np.ndarray:
+    """
+    Match each chunk's loudness to a common target.
+
+    Chunks are generated independently, and measured level varies by up to ~12dB
+    between them, which is audible as the voice dipping mid-response. Level is
+    measured over voiced samples only, so a chunk padded with silence isn't
+    amplified to compensate for the silence.
+    """
+    voiced = audio[np.abs(audio) > TTS_SILENCE_FLOOR]
+    if voiced.size < 100:
+        return audio
+
+    rms = float(np.sqrt((voiced ** 2).mean()))
+    if rms <= 0:
+        return audio
+
+    audio = audio * min(TTS_TARGET_RMS / rms, TTS_MAX_GAIN)
+
+    peak = float(np.abs(audio).max())
+    if peak > 0.99:
+        audio = audio * (0.99 / peak)
+    return audio
+
+def trim_silence(audio: np.ndarray) -> np.ndarray:
+    """Trim leading/trailing near-silence, keeping a short pad so nothing is clipped."""
+    voiced = np.flatnonzero(np.abs(audio) > TTS_SILENCE_FLOOR)
+    if voiced.size == 0:
+        return audio
+    pad = int(TTS_TRIM_PAD_MS / 1000 * _tts_model.sample_rate)
+    return audio[max(0, voiced[0] - pad):min(len(audio), voiced[-1] + pad + 1)]
+
 def generate_speech_chunk(text: str) -> np.ndarray:
     """Generate audio for a text chunk. Runs in a thread."""
-    audio = _tts_model.generate_audio(_tts_voice_state, text)
-    return audio.numpy()
+    audio = _tts_model.generate_audio(_tts_voice_state, text).numpy().reshape(-1)
+    return normalize_chunk(trim_silence(audio))
 
 def play_audio(audio_np: np.ndarray):
     """Play audio and wait for completion."""
@@ -203,14 +248,16 @@ def chunk_sentences(text_stream, on_chunk=None):
     Yields (chunk_text, is_final) tuples.
     """
     buffer = ""
+    emitted = 0
     for token in text_stream:
         buffer += token
         # Check if we should flush
         should_flush = False
 
         # Flush on sentence-ending punctuation (if chunk is long enough)
+        endings = SENTENCE_ENDINGS + (FIRST_CHUNK_ENDINGS if emitted == 0 else "")
         if len(buffer) >= MIN_CHUNK_CHARS:
-            for ending in SENTENCE_ENDINGS:
+            for ending in endings:
                 if buffer.rstrip().endswith(ending):
                     should_flush = True
                     break
@@ -223,6 +270,7 @@ def chunk_sentences(text_stream, on_chunk=None):
             chunk = buffer.strip()
             buffer = ""
             if chunk:
+                emitted += 1
                 yield chunk
 
     # Flush remaining
