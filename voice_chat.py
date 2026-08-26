@@ -1,14 +1,20 @@
 # Voice Chat — Local Pipeline with Voice Cloning + Streaming TTS
 #
 # Components:
-#   1. STT:  whisper.cpp (Metal-accelerated) via subprocess
-#   2. LLM:  Ollama (llama3.2:3b) — streamed token-by-token
-#   3. TTS:  Pocket-TTS — sentence-chunked streaming, plays while LLM still generates
+#   1. Turn:  Silero VAD + Smart Turn v3 — hands-free end-of-turn detection
+#   2. STT:   whisper.cpp (Metal-accelerated) via subprocess
+#   3. LLM:   Ollama (llama3.2:3b) — streamed token-by-token
+#   4. TTS:   Pocket-TTS — sentence-chunked streaming, plays while LLM still generates
 #
-# Pipeline: mic -> whisper.cpp -> ollama (stream) -> sentence buffer -> pocket-tts -> speaker
+# Pipeline: mic -> vad + smart-turn -> whisper.cpp -> ollama (stream)
+#           -> sentence buffer -> pocket-tts -> speaker
+#
+# Turn taking is half-duplex: the mic closes while the bot speaks, so there is
+# no barge-in and no echo. See turn_taking.py.
 #
 # Usage:
-#   uv run voice_chat.py
+#   uv run voice_chat.py                 # hands-free
+#   uv run voice_chat.py --push-to-talk  # press Enter to start/stop recording
 #
 # First run: exports voice state from voices/clone_voice.wav -> voices/clone_voice.safetensors
 # Subsequent runs: loads safetensors directly (fast)
@@ -33,6 +39,8 @@ import sounddevice as sd
 from scipy.io.wavfile import write as wav_write
 from pocket_tts import TTSModel, export_model_state
 
+from turn_taking import TurnListener
+
 # ── Config ──────────────────────────────────────────────────────────────
 
 WHISPER_CLI = "/opt/homebrew/bin/whisper-cli"
@@ -46,6 +54,9 @@ TTS_VOICE_FALLBACK = "alba"
 
 SAMPLE_RATE = 16000
 MAX_RECORD_SECONDS = 30
+
+# Spoken phrases that end a hands-free session
+QUIT_PHRASES = ("quit", "exit", "goodbye", "good bye", "bye", "stop chatting")
 
 SYSTEM_PROMPT = (
     "You are a friendly, concise conversational partner. "
@@ -246,6 +257,12 @@ def chat_streaming(prompt: str):
 
 # ── STT ────────────────────────────────────────────────────────────────
 
+def write_temp_wav(audio: np.ndarray) -> str:
+    """Write mono float32 audio to a temp 16-bit wav for whisper.cpp."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    wav_write(tmp.name, SAMPLE_RATE, (audio * 32767).astype(np.int16))
+    return tmp.name
+
 def record_audio() -> str:
     print("🎙️  Recording... (press Enter to stop)", flush=True)
 
@@ -282,9 +299,7 @@ def record_audio() -> str:
     duration = len(audio) / SAMPLE_RATE
     print(f"  📼 Recorded {duration:.1f}s", flush=True)
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    wav_write(tmp.name, SAMPLE_RATE, (audio * 32767).astype(np.int16))
-    return tmp.name
+    return write_temp_wav(audio)
 
 def transcribe(audio_path: str) -> str:
     cmd = [
@@ -304,18 +319,7 @@ def transcribe(audio_path: str) -> str:
 
 # ── Main ───────────────────────────────────────────────────────────────
 
-def main():
-    print()
-    print("╔══════════════════════════════════════════════╗")
-    print("║   🦊 Local Voice Chat (streaming, offline)   ║")
-    print("╠══════════════════════════════════════════════╣")
-    print("║  Press Enter to talk, type 'quit' to exit     ║")
-    print("╚══════════════════════════════════════════════╝")
-    print()
-
-    init_tts()
-
-    # Ensure Ollama is running
+def ensure_ollama():
     try:
         urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2)
     except Exception:
@@ -323,28 +327,87 @@ def main():
         subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(2)
 
+def is_quit(text: str) -> bool:
+    cleaned = text.lower().strip().strip(".!?,")
+    return cleaned in QUIT_PHRASES
+
+BANNER_WIDTH = 56
+
+def banner(hands_free: bool):
+    mode = "hands-free" if hands_free else "push-to-talk"
+    hint = ("Just start talking — say 'goodbye' or Ctrl-C to exit"
+            if hands_free else
+            "Press Enter to talk, type 'quit' to exit")
+
+    def row(text, indent=2, emoji_cells=0):
+        # Emoji render two columns wide but count as one character
+        pad = BANNER_WIDTH - indent - len(text) - emoji_cells
+        return "║" + " " * indent + text + " " * max(pad, 0) + "║"
+
+    print()
+    print("╔" + "═" * BANNER_WIDTH + "╗")
+    print(row(f"🦊 Local Voice Chat ({mode}, offline)", indent=3, emoji_cells=1))
+    print("╠" + "═" * BANNER_WIDTH + "╣")
+    print(row(hint))
+    print("╚" + "═" * BANNER_WIDTH + "╝")
+    print()
+
+def next_prompt_hands_free(listener) -> str | None:
+    """Capture one spoken turn and transcribe it. None means 'nothing usable'."""
+    audio = listener.listen()
+    if audio is None:
+        return None
+
+    t0 = time.time()
+    text = transcribe(write_temp_wav(audio))
+    print(f"  📝 STT ({time.time() - t0:.2f}s): \"{text}\"", flush=True)
+    return text or None
+
+def next_prompt_push_to_talk(turn: int) -> str | None:
+    """Legacy path: Enter to record, Enter again to stop. Typed text also works."""
+    typed = input(f"\n[{turn}] Press Enter to record (or type 'quit'): ").strip()
+    if is_quit(typed):
+        return "__quit__"
+    if typed:
+        return typed
+
+    audio_path = record_audio()
+    if not audio_path:
+        return None
+
+    t0 = time.time()
+    text = transcribe(audio_path)
+    print(f"  📝 STT ({time.time() - t0:.2f}s): \"{text}\"", flush=True)
+    if not text:
+        print("  (empty transcript, skipping)")
+        return None
+    return text
+
+def main():
+    hands_free = "--push-to-talk" not in sys.argv
+    banner(hands_free)
+
+    init_tts()
+    listener = TurnListener() if hands_free else None
+    ensure_ollama()
+
     turn = 0
     while True:
         try:
-            user_input = input(f"\n[{turn}] Press Enter to record (or type 'quit'): ")
-            if user_input.strip().lower() in ("quit", "exit", "q"):
+            if hands_free:
+                user_text = next_prompt_hands_free(listener)
+            else:
+                user_text = next_prompt_push_to_talk(turn)
+
+            if user_text is None:
+                continue
+            if user_text == "__quit__" or is_quit(user_text):
                 print("👋 Bye!")
                 break
-            if user_input.strip():
-                user_text = user_input.strip()
-            else:
-                audio_path = record_audio()
-                if not audio_path:
-                    continue
-                t0 = time.time()
-                user_text = transcribe(audio_path)
-                stt_time = time.time() - t0
-                print(f"  📝 STT ({stt_time:.2f}s): \"{user_text}\"", flush=True)
-                if not user_text:
-                    print("  (empty transcript, skipping)")
-                    continue
 
-            # Stream LLM → chunk → TTS (plays while generating)
+            # Stream LLM → chunk → TTS (plays while generating).
+            # In hands-free mode the mic is already closed, so this can't
+            # hear itself.
             print("  🧠 Thinking + speaking...", flush=True)
             chat_streaming(user_text)
 

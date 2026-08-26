@@ -2,6 +2,7 @@
 
 Fully offline voice chat pipeline running on Apple Silicon (M4 Mac mini). No API keys, no cloud, fully private.
 
+- **Turn taking:** [Silero VAD](https://github.com/snakers4/silero-vad) + [Smart Turn v3](https://huggingface.co/pipecat-ai/smart-turn-v3) — hands-free, ~15ms CPU
 - **STT:** [whisper.cpp](https://github.com/ggerganov/whisper.cpp) (Metal-accelerated) — ~0.3s for short utterances
 - **LLM:** [Ollama](https://ollama.com) (llama3.2:3b) — ~37 tok/s warm
 - **TTS:** [Pocket-TTS](https://github.com/kyutai-labs/pocket-tts) — 6x realtime, 200ms to first audio, voice cloning
@@ -28,7 +29,7 @@ ollama pull llama3.2:3b   # 2GB, ~37 tok/s on M4
 #    a) Accept terms at: https://huggingface.co/kyutai/pocket-tts
 #    b) Log in locally:
 pip install huggingface-hub
-huggingface-cli login  # paste a read token from https://huggingface.co/settings/tokens
+hf auth login  # paste a read token from https://huggingface.co/settings/tokens
 ```
 
 ## Install
@@ -83,16 +84,50 @@ uvx pocket-tts generate --voice ./voices/your_voice.safetensors --text "Hello wo
 ## Run
 
 ```bash
-uv run voice_chat.py
+uv run voice_chat.py                 # hands-free (default)
+uv run voice_chat.py --push-to-talk  # Enter to start, Enter to stop
 ```
 
-1. **Press Enter** → starts recording from mic
-2. **Press Enter again** → stops recording
+Hands-free:
+
+1. **Just start talking** → Silero VAD opens a turn within ~64ms
+2. **Stop talking** → after 200ms of silence, Smart Turn v3 decides whether
+   you're actually finished or just pausing mid-sentence; if unsure it keeps
+   listening and re-checks every 200ms
 3. whisper.cpp transcribes (~0.3s)
 4. llama3.2:3b generates a response (~500ms)
 5. Pocket-TTS speaks the response in the cloned voice (~200ms to first audio)
-6. Audio plays through speakers
-7. Type `quit` to exit
+6. Audio plays through speakers, mic closed
+7. Say "goodbye" (or Ctrl-C) to exit
+
+## Turn taking
+
+Two models cooperate, which is how Smart Turn is designed to be used:
+
+- **Silero VAD** runs on every 32ms frame (~3ms) and answers "is there sound?"
+- **Smart Turn v3** runs only *during* silence (~13ms) and answers "are they
+  finished?" — from the raw waveform, not the transcript. It's a Whisper-tiny
+  encoder plus a linear head, 8MB int8 ONNX, downloaded on first run.
+
+The distinction matters: a 400ms pause mid-sentence and a 400ms pause at the
+end of a turn look identical to a VAD. Smart Turn scores the first around 0.01
+and the second around 0.97, so you don't get interrupted mid-thought and you
+don't wait out a fixed timeout when you're plainly done.
+
+Turn taking is **half-duplex** — the mic stream is closed while the bot speaks.
+That rules out barge-in, but it also means TTS output can never be fed back
+into the detector, so no echo cancellation is needed and speakers work fine.
+
+Tunables live at the top of `turn_taking.py`:
+
+| Setting | Default | Effect |
+|---------|---------|--------|
+| `SILENCE_PROBE_MS` | `200` | Silence before the first Smart Turn check — the floor on response latency |
+| `PROBE_INTERVAL_MS` | `200` | How often to re-check while silence continues |
+| `MAX_SILENCE_MS` | `3000` | Hard fallback; ends the turn however Smart Turn votes |
+| `SMART_TURN_THRESHOLD` | `0.5` | Raise to interrupt less, lower to respond faster |
+| `VAD_THRESHOLD` | `0.5` | Raise in a noisy room |
+| `PREROLL_SECONDS` | `0.3` | Audio kept from before speech onset, so word one isn't clipped |
 
 ## Configuration
 
@@ -110,6 +145,8 @@ Edit `voice_chat.py` to change:
 
 | Component | Metric |
 |-----------|--------|
+| Silero VAD | ~3ms per 32ms frame |
+| Smart Turn v3 (int8 ONNX) | ~13ms per check, 8MB model |
 | whisper.cpp (base.en) | 20x realtime (5.5s audio → 0.28s) |
 | llama3.2:3b (warm) | ~37 tok/s |
 | Pocket-TTS | 6.1x realtime (5.5s audio → 0.9s), 200ms to first chunk |
@@ -120,9 +157,14 @@ Edit `voice_chat.py` to change:
 ## Architecture
 
 ```
-mic → sounddevice (16kHz) → whisper.cpp (Metal) → text
+mic → sounddevice (16kHz) → Silero VAD (32ms frames)
+                                  ↓ silence
+                            Smart Turn v3 (ONNX) → turn complete?
+                                  ↓ yes
+                            whisper.cpp (Metal) → text
                                                        ↓
     speaker ← Pocket-TTS (CPU, 24kHz) ← Ollama (llama3.2:3b)
+       (mic closed while speaking — half-duplex)
 ```
 
 All processing is local. No network calls except Ollama on localhost:11434.
