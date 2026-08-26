@@ -27,11 +27,16 @@ curl -L -o ~/.local/share/whisper-cpp/ggml-base.bin \
 brew install ollama  # or download from ollama.com
 ollama pull qwen2.5:7b    # 4.7GB — handles all six languages
 
-# 4. HuggingFace auth (for voice cloning model — gated access)
-#    a) Accept terms at: https://huggingface.co/kyutai/pocket-tts
-#    b) Log in locally:
-pip install huggingface-hub
-hf auth login  # paste a read token from https://huggingface.co/settings/tokens
+# 4. HuggingFace auth — the voice cloning weights are gated
+#    a) Accept the terms at: https://huggingface.co/kyutai/pocket-tts
+#    b) Log in locally. This opens a browser device-code flow (it prints a code
+#       to enter at hf.co/oauth/device) and blocks until you authorise:
+uvx hf auth login
+#    Non-interactive alternative, with a read token from
+#    https://huggingface.co/settings/tokens:
+uvx hf auth login --token hf_xxxxx
+
+# Skipping this is fine — the app runs and falls back to preset voices.
 ```
 
 ## Install
@@ -48,7 +53,7 @@ Pocket-TTS ships **one set of weights per language**, so the language is detecte
 first utterance with `whisper -l auto` and then **locked for the session** — switching means
 loading different TTS weights and a different cloned voice state.
 
-| Code | Language | Pocket-TTS model | Preset voice |
+| Code | Language | Pocket-TTS model | Preset voice (fallback) |
 |------|----------|------------------|--------------|
 | `en` | English | `english` (6-layer) | `alba` |
 | `de` | German | `german` (6-layer) | `juergen` |
@@ -62,6 +67,9 @@ of the others, which roughly triples time-to-first-audio (~1.0s vs ~0.3s). Every
 language has a 6-layer model.
 
 Anything outside these six (whisper knows ~99 languages) falls back to English with a warning.
+
+With a HuggingFace login your cloned voice is used for **every** language, each exported to
+its own state file on first use. The preset column is what you get without one.
 
 ### Pinning or testing a language
 
@@ -78,7 +86,9 @@ Auto-detection is reliable on clear speech but can fail on short or noisy uttera
 
 ## Voice Cloning
 
-The script uses a voice sample in `voices/clone_voice.wav` (18s, 24kHz mono). On first run, it exports a `.safetensors` voice state for fast subsequent loads.
+The script uses a voice sample in `voices/clone_voice.wav` (18s, 24kHz mono). The first time
+you use each language it exports a `.safetensors` voice state for that language, so later
+runs load in a fraction of a second.
 
 ### Use your own voice
 
@@ -214,14 +224,17 @@ Edit `voice_chat.py` to change:
 | Smart Turn v3 (int8 ONNX) | ~13ms per check, 8MB model |
 | whisper.cpp (base multilingual) | ~0.2s for a 6s utterance, including `-l auto` detection |
 | qwen2.5:7b (warm) | ~50 tok/s, 0.26s to first sentence |
-| Pocket-TTS, 6-layer (en/de/it/pt/es) | 0.30–0.45s to first audio |
-| Pocket-TTS, 24-layer (fr) | ~1.0s to first audio |
-| Model load (Pocket-TTS) | 20–55s first run (downloads weights), 0.4–1.7s cached |
-| Voice state load (safetensors) | <1s |
-| Voice state export (from wav) | ~1s for 18s clip |
+| Pocket-TTS, 6-layer (en/de/it/pt/es) | 0.05–0.14s to first audio, warm, short sentence |
+| Pocket-TTS, 24-layer (fr) | 0.47s to first audio — ~4x the others, matching 4x the layers |
+| Model load (Pocket-TTS) | 20–55s first run (downloads weights), 0.16–0.18s cached (0.47s fr) |
+| Voice state load (safetensors) | <0.5s |
+| Voice state export (from wav) | ~1s for 18s clip, once per language |
+
+Time to first audio scales with chunk length; the figures above are a short sentence. A
+full-length opening chunk in normal conversation lands around 0.2–0.5s.
 
 Each language's weights download once (~20s for a 6-layer model, ~55s for French) and are
-cached in `~/.cache/huggingface`. After that, switching language costs under 2 seconds.
+cached in `~/.cache/huggingface`. After that, switching language costs well under a second.
 
 **Why one LLM for every language.** A 3B model generates roughly twice the tokens per second
 of `qwen2.5:7b`, but that barely matters here: TTS playback is slower than generation, so
@@ -242,6 +255,11 @@ The LLM's output is split into chunks and spoken as it streams. Two details matt
 - **Chunks are loudness-matched.** Generated independently, chunk level varied by up to
   12dB. Each is now normalised to `TTS_TARGET_RMS`, measured over voiced samples only so
   a chunk padded with silence isn't amplified to compensate.
+- **Playback uses one long-lived output stream.** `sd.play()` opens and closes a CoreAudio
+  stream per call, measured at 390–640ms of dead air *per chunk* regardless of audio
+  length — seconds of silence punched into a multi-chunk response. Writing into a single
+  persistent stream brings that to ~0.04s total. `drain_playback()` then waits out the
+  device latency before the mic reopens, which is what keeps half-duplex honest.
 
 ## Architecture
 

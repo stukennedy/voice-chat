@@ -195,6 +195,9 @@ def init_tts(lang_code: str):
     _tts_model = TTSModel.load_model(language=tts_lang)
     _tts_language = tts_lang
     _tts_voice_state = _resolve_voice_state(tts_lang)
+    # Open the output stream now so CoreAudio spins up here rather than stalling the
+    # first chunk of the first response.
+    _output(_tts_model.sample_rate)
     print(f"🔊 TTS ready — {language_name(lang_code)} ({time.time() - t0:.1f}s).", flush=True)
 
 def normalize_chunk(audio: np.ndarray) -> np.ndarray:
@@ -234,10 +237,41 @@ def generate_speech_chunk(text: str) -> np.ndarray:
     audio = _tts_model.generate_audio(_tts_voice_state, text).numpy().reshape(-1)
     return normalize_chunk(trim_silence(audio))
 
+_output_stream = None
+
+def _output(sample_rate: int):
+    """
+    One persistent output stream for the whole session.
+
+    sd.play() opens and closes a CoreAudio stream on every call, which measured at
+    390-640ms of dead air per chunk regardless of audio length. Across a multi-chunk
+    response that is seconds of silence punched into the middle of the speech — heard
+    as the voice cutting in and out. Writing into one long-lived stream is gapless.
+    """
+    global _output_stream
+    if _output_stream is not None and _output_stream.samplerate != sample_rate:
+        _output_stream.stop()
+        _output_stream.close()
+        _output_stream = None
+    if _output_stream is None:
+        _output_stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32")
+        _output_stream.start()
+    return _output_stream
+
 def play_audio(audio_np: np.ndarray):
-    """Play audio and wait for completion."""
-    sd.play(audio_np, _tts_model.sample_rate)
-    sd.wait()
+    """Queue a chunk for gapless playback."""
+    _output(_tts_model.sample_rate).write(audio_np)
+
+def drain_playback():
+    """
+    Block until queued audio has actually been heard.
+
+    Half-duplex turn taking depends on this: the mic reopens as soon as the response
+    returns, and write() hands audio to the device rather than waiting for it to play.
+    Without this the VAD would hear the tail of the bot's own speech.
+    """
+    if _output_stream is not None:
+        time.sleep(_output_stream.latency)
 
 # ── Sentence chunker ────────────────────────────────────────────────────
 
@@ -391,6 +425,7 @@ def speak_stream(sentence_stream, t0=None):
         chunks_played += 1
 
     tts_thread.join(timeout=5)
+    drain_playback()
 
     total = time.time() - t0
     print(f"  🧠 Total: {total:.2f}s, {chunks_played} chunks", flush=True)
