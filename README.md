@@ -74,15 +74,23 @@ its own state file on first use. The preset column is what you get without one.
 ### Pinning or testing a language
 
 ```bash
-uv run voice_chat.py                  # auto-detect from first utterance
-uv run voice_chat.py --lang de        # skip detection, pin to German
+uv run voice_chat.py                       # auto-detect from first utterance
+uv run voice_chat.py --lang it             # skip detection, pin to Italian
+uv run voice_chat.py --lang it --push-to-talk   # combines with either turn-taking mode
 
 # Smoke test a language without a mic or the LLM:
 uv run voice_chat.py --lang fr --text "Bonjour, comment allez-vous?"
 ```
 
-Auto-detection is reliable on clear speech but can fail on short or noisy utterances — pin
-`--lang` if you always use the same language.
+**Detection keys on pronunciation, not vocabulary.** Whisper classifies how the speech
+sounds, so correctly-pronounced Italian is detected from as little as 1.6s, while Italian
+spoken with a strong English accent is detected as English however long the sample. Two
+things that do *not* help, both measured: a longer utterance, and `ggml-small.bin` — it
+returned identical results to `ggml-base.bin` on every sample tested.
+
+If a language isn't detected reliably in your voice, pin it with `--lang`. That skips
+detection entirely and is the intended fix — the language is locked for the session either
+way, so pinning costs you nothing.
 
 ## Voice Cloning
 
