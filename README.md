@@ -4,10 +4,12 @@ Fully offline voice chat pipeline running on Apple Silicon (M4 Mac mini). No API
 
 - **Turn taking:** [Silero VAD](https://github.com/snakers4/silero-vad) + [Smart Turn v3](https://huggingface.co/pipecat-ai/smart-turn-v3) — hands-free, ~15ms CPU
 - **STT:** [whisper.cpp](https://github.com/ggerganov/whisper.cpp) (Metal-accelerated) — ~0.3s for short utterances
-- **LLM:** [Ollama](https://ollama.com) (llama3.2:3b) — ~37 tok/s warm
+- **LLM:** [Ollama](https://ollama.com) (qwen2.5:7b) — ~50 tok/s warm, all six languages
 - **TTS:** [Pocket-TTS](https://github.com/kyutai-labs/pocket-tts) — 6x realtime, 200ms to first audio, voice cloning
 
 **Total round-trip latency: ~700ms–1s** for a short exchange.
+
+Speaks **English, French, German, Italian, Portuguese and Spanish** — see [Languages](#languages).
 
 ## Prerequisites
 
@@ -15,15 +17,15 @@ Fully offline voice chat pipeline running on Apple Silicon (M4 Mac mini). No API
 # 1. whisper.cpp (via Homebrew)
 brew install whisper-cpp
 
-# 2. Whisper model — base.en (141MB, good for realtime English)
+# 2. Whisper model — base multilingual (148MB, detects and transcribes all 6 languages)
 mkdir -p ~/.local/share/whisper-cpp
-curl -L -o ~/.local/share/whisper-cpp/ggml-base.en.bin \
-  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+curl -L -o ~/.local/share/whisper-cpp/ggml-base.bin \
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"
+# Optional: ggml-small.bin (466MB) — better non-English accuracy, ~2x slower
 
-# 3. Ollama + a model
+# 3. Ollama + models
 brew install ollama  # or download from ollama.com
-ollama pull llama3.2:3b   # 2GB, ~37 tok/s on M4
-# Optional: ollama pull qwen3:8b  (smarter but slower, uses more RAM)
+ollama pull qwen2.5:7b    # 4.7GB — handles all six languages
 
 # 4. HuggingFace auth (for voice cloning model — gated access)
 #    a) Accept terms at: https://huggingface.co/kyutai/pocket-tts
@@ -40,6 +42,40 @@ cd voice-chat
 uv sync
 ```
 
+## Languages
+
+Pocket-TTS ships **one set of weights per language**, so the language is detected from your
+first utterance with `whisper -l auto` and then **locked for the session** — switching means
+loading different TTS weights and a different cloned voice state.
+
+| Code | Language | Pocket-TTS model | Preset voice |
+|------|----------|------------------|--------------|
+| `en` | English | `english` (6-layer) | `alba` |
+| `de` | German | `german` (6-layer) | `juergen` |
+| `it` | Italian | `italian` (6-layer) | `giovanni` |
+| `pt` | Portuguese | `portuguese` (6-layer) | `rafael` |
+| `es` | Spanish | `spanish` (6-layer) | `lola` |
+| `fr` | French | `french_24l` (24-layer) | `estelle` |
+
+**French is the slow one.** Kyutai only publishes a 24-layer model for French — 4x the layers
+of the others, which roughly triples time-to-first-audio (~1.0s vs ~0.3s). Every other
+language has a 6-layer model.
+
+Anything outside these six (whisper knows ~99 languages) falls back to English with a warning.
+
+### Pinning or testing a language
+
+```bash
+uv run voice_chat.py                  # auto-detect from first utterance
+uv run voice_chat.py --lang de        # skip detection, pin to German
+
+# Smoke test a language without a mic or the LLM:
+uv run voice_chat.py --lang fr --text "Bonjour, comment allez-vous?"
+```
+
+Auto-detection is reliable on clear speech but can fail on short or noisy utterances — pin
+`--lang` if you always use the same language.
+
 ## Voice Cloning
 
 The script uses a voice sample in `voices/clone_voice.wav` (18s, 24kHz mono). On first run, it exports a `.safetensors` voice state for fast subsequent loads.
@@ -52,9 +88,22 @@ Replace `voices/clone_voice.wav` with your own clean recording:
 # Convert any audio to the right format (24kHz mono 16-bit WAV)
 ffmpeg -i your_recording.wav -ar 24000 -ac 1 -sample_fmt s16 voices/clone_voice.wav
 
-# Delete the cached safetensors so it re-exports
-rm voices/clone_voice.safetensors
+# Delete the cached safetensors so they re-export
+rm voices/clone_voice.*.safetensors
 ```
+
+**Cloned voice states are per-language.** `get_state_for_audio_prompt` encodes your wav
+through the currently loaded model, so a state exported against the English weights is
+meaningless to the German ones. Each language gets its own file, exported on first use:
+
+```
+voices/clone_voice.wav                     # your recording — the source of truth
+voices/clone_voice.english.safetensors     # exported on first English run
+voices/clone_voice.german.safetensors      # exported on first German run
+...
+```
+
+Bear in mind an English speaker's cloned timbre reading French will carry an English accent.
 
 **Tips for good cloning:**
 - 10–30 seconds of clean single-speaker speech
@@ -64,12 +113,20 @@ rm voices/clone_voice.safetensors
 
 ### Use a preset voice instead
 
-Edit `voice_chat.py` and change `TTS_VOICE_FALLBACK` to one of:
-`alba`, `anna`, `azelma`, `charles`, `cosette`, `eponine`, `estelle`, `fantine`,
-`george`, `giovanni`, `jane`, `jean`, `javert`, `juergen`, `lola`, `marius`,
-`mary`, `michael`, `paul`, `peter_yearsley`, `rafael`, `stuart_bell`, `vera`
+Delete the wav and the safetensors in `voices/` and each language falls back to its preset
+(see the [Languages](#languages) table). To pick different ones, edit `PRESET_VOICE` in
+`voice_chat.py`.
 
-Then delete the safetensors file and the wav file in `voices/`.
+Preset voice states are stored **per language** in the model repo, so a name from one
+language does not exist in another — `alba` is English-only, `giovanni` is Italian-only.
+The full English catalogue: `alba`, `anna`, `azelma`, `charles`, `cosette`, `eponine`,
+`fantine`, `george`, `jane`, `jean`, `javert`, `marius`, `mary`, `michael`, `paul`,
+`peter_yearsley`, `stuart_bell`, `vera`.
+
+**Without a HuggingFace login, cloning is unavailable** — the gated `kyutai/pocket-tts`
+weights can't be downloaded, Pocket-TTS silently falls back to the no-cloning weights, and
+the app uses the preset voice with a warning. Accept the terms and run `uvx hf auth login`
+to enable cloning.
 
 ### Export a voice via CLI
 
@@ -94,11 +151,15 @@ Hands-free:
 2. **Stop talking** → after 200ms of silence, Smart Turn v3 decides whether
    you're actually finished or just pausing mid-sentence; if unsure it keeps
    listening and re-checks every 200ms
-3. whisper.cpp transcribes (~0.3s)
-4. llama3.2:3b generates a response (~500ms)
-5. Pocket-TTS speaks the response in the cloned voice (~200ms to first audio)
-6. Audio plays through speakers, mic closed
-7. Say "goodbye" (or Ctrl-C) to exit
+3. whisper.cpp transcribes and detects the language (~0.3s)
+4. On the first turn the language is locked, and its TTS model loaded if it isn't already
+5. qwen2.5:7b generates a response, instructed to reply in that language (~500ms)
+6. Pocket-TTS speaks the response in the cloned voice (~200ms to first audio)
+7. Audio plays through speakers, mic closed
+8. Say "goodbye" (or Ctrl-C) to exit
+
+Push-to-talk follows the same flow, with Enter to start and stop recording instead of
+steps 1–2. Typed input also works there; it carries no audio, so it never locks a language.
 
 ## Turn taking
 
@@ -135,9 +196,11 @@ Edit `voice_chat.py` to change:
 
 | Setting | Default | Options |
 |---------|---------|---------|
-| `OLLAMA_MODEL` | `llama3.2:3b` | `qwen3:8b` (smarter, slower), any Ollama model |
-| `WHISPER_MODEL` | `ggml-base.en.bin` | `ggml-small.en.bin` (better accuracy, ~2x slower) |
-| `TTS_VOICE_FALLBACK` | `alba` | Any preset voice name |
+| `OLLAMA_MODEL` | `qwen2.5:7b` | Any Ollama model that speaks your languages |
+| `WHISPER_MODEL` | `ggml-base.bin` | `ggml-small.bin` (better non-English, ~2x slower) |
+| `LANGUAGES` | 6 languages | Maps whisper codes → Pocket-TTS models; swap `german` for `german_24l` etc. |
+| `PRESET_VOICE` | per-language | Fallback voice when no clone is available |
+| `DEFAULT_LANGUAGE` | `en` | Used for typed input and unsupported detections |
 | `MAX_RECORD_SECONDS` | `30` | Max recording length |
 | `SYSTEM_PROMPT` | concise conversational | Edit to change LLM personality |
 
@@ -147,12 +210,23 @@ Edit `voice_chat.py` to change:
 |-----------|--------|
 | Silero VAD | ~3ms per 32ms frame |
 | Smart Turn v3 (int8 ONNX) | ~13ms per check, 8MB model |
-| whisper.cpp (base.en) | 20x realtime (5.5s audio → 0.28s) |
-| llama3.2:3b (warm) | ~37 tok/s |
-| Pocket-TTS | 6.1x realtime (5.5s audio → 0.9s), 200ms to first chunk |
-| Model load (Pocket-TTS) | ~10s first run, cached after |
+| whisper.cpp (base multilingual) | ~0.2s for a 6s utterance, including `-l auto` detection |
+| qwen2.5:7b (warm) | ~50 tok/s, 0.26s to first sentence |
+| Pocket-TTS, 6-layer (en/de/it/pt/es) | 0.30–0.45s to first audio |
+| Pocket-TTS, 24-layer (fr) | ~1.0s to first audio |
+| Model load (Pocket-TTS) | 20–55s first run (downloads weights), 0.4–1.7s cached |
 | Voice state load (safetensors) | <1s |
 | Voice state export (from wav) | ~1s for 18s clip |
+
+Each language's weights download once (~20s for a 6-layer model, ~55s for French) and are
+cached in `~/.cache/huggingface`. After that, switching language costs under 2 seconds.
+
+**Why one LLM for every language.** A 3B model generates roughly twice the tokens per second
+of `qwen2.5:7b`, but that barely matters here: TTS playback is slower than generation, so
+after the first sentence the LLM always has slack. Measured time to first sentence was 0.18s
+for `llama3.2:3b` against 0.26s for `qwen2.5:7b` — an 80ms difference. Using a separate model
+per language would trade that 80ms for a 30–60s model eviction and reload the first time you
+switch language, so the pipeline uses one model throughout.
 
 ## Architecture
 
@@ -161,10 +235,12 @@ mic → sounddevice (16kHz) → Silero VAD (32ms frames)
                                   ↓ silence
                             Smart Turn v3 (ONNX) → turn complete?
                                   ↓ yes
-                            whisper.cpp (Metal) → text
-                                                       ↓
-    speaker ← Pocket-TTS (CPU, 24kHz) ← Ollama (llama3.2:3b)
-       (mic closed while speaking — half-duplex)
+                            whisper.cpp (Metal) → text + detected language
+                                  ↓
+                            language locked for session
+                                  ↓
+  speaker ← Pocket-TTS (CPU, 24kHz, per-language model) ← Ollama (qwen2.5:7b)
+     (mic closed while speaking — half-duplex)
 ```
 
 All processing is local. No network calls except Ollama on localhost:11434.

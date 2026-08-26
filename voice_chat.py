@@ -2,8 +2,8 @@
 #
 # Components:
 #   1. Turn:  Silero VAD + Smart Turn v3 — hands-free end-of-turn detection
-#   2. STT:   whisper.cpp (Metal-accelerated) via subprocess
-#   3. LLM:   Ollama (llama3.2:3b) — streamed token-by-token
+#   2. STT:   whisper.cpp (Metal-accelerated) via subprocess — multilingual
+#   3. LLM:   Ollama (qwen2.5:7b) — streamed token-by-token
 #   4. TTS:   Pocket-TTS — sentence-chunked streaming, plays while LLM still generates
 #
 # Pipeline: mic -> vad + smart-turn -> whisper.cpp -> ollama (stream)
@@ -12,13 +12,21 @@
 # Turn taking is half-duplex: the mic closes while the bot speaks, so there is
 # no barge-in and no echo. See turn_taking.py.
 #
-# Usage:
-#   uv run voice_chat.py                 # hands-free
-#   uv run voice_chat.py --push-to-talk  # press Enter to start/stop recording
+# Languages: english, french, german, italian, portuguese, spanish.
+# Pocket-TTS ships one set of weights per language, so the language is detected from
+# the first utterance and then locked for the rest of the session.
 #
-# First run: exports voice state from voices/clone_voice.wav -> voices/clone_voice.safetensors
-# Subsequent runs: loads safetensors directly (fast)
+# Usage:
+#   uv run voice_chat.py                        # hands-free, auto-detect language
+#   uv run voice_chat.py --push-to-talk         # press Enter to start/stop recording
+#   uv run voice_chat.py --lang de              # pinned to German
+#   uv run voice_chat.py --lang de --text "..." # non-interactive smoke test (no mic, no LLM)
+#
+# First run per language: exports voice state from voices/clone_voice.wav
+#   -> voices/clone_voice.<language>.safetensors
+# Subsequent runs: loads that safetensors directly (fast)
 
+import argparse
 import subprocess
 import json
 import time
@@ -44,13 +52,43 @@ from turn_taking import TurnListener
 # ── Config ──────────────────────────────────────────────────────────────
 
 WHISPER_CLI = "/opt/homebrew/bin/whisper-cli"
-WHISPER_MODEL = os.path.expanduser("~/.local/share/whisper-cpp/ggml-base.en.bin")
+# Multilingual weights (no .en suffix). Use ggml-small.bin for better non-English
+# accuracy at roughly 2x the transcription time.
+WHISPER_MODEL = os.path.expanduser("~/.local/share/whisper-cpp/ggml-base.bin")
 OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "llama3.2:3b"
 
-VOICE_WAV = str(Path(__file__).parent / "voices" / "clone_voice.wav")
-VOICE_SAFETENSORS = str(Path(__file__).parent / "voices" / "clone_voice.safetensors")
-TTS_VOICE_FALLBACK = "alba"
+# One model for every language. A 3B model is faster per token, but only the first sentence
+# is latency-critical (after that, playback is slower than generation), and the gap there is
+# ~80ms — not worth evicting and reloading gigabytes of weights on a language switch.
+OLLAMA_MODEL = "qwen2.5:7b"
+
+# Whisper ISO code -> (Pocket-TTS config name, human-readable name)
+# Pocket-TTS has 6-layer and 24-layer variants of most languages; the 6-layer ones are
+# ~4x cheaper and are what keeps latency near the English numbers. French is 24-layer only.
+LANGUAGES = {
+    "en": ("english", "English"),
+    "fr": ("french_24l", "French"),
+    "de": ("german", "German"),
+    "it": ("italian", "Italian"),
+    "pt": ("portuguese", "Portuguese"),
+    "es": ("spanish", "Spanish"),
+}
+DEFAULT_LANGUAGE = "en"
+
+# Preset voice per Pocket-TTS language, used when there is no cloned voice available.
+# Preset voice states live under languages/<lang>/embeddings/ in the model repo, so a
+# preset name from one language does not exist in another.
+PRESET_VOICE = {
+    "english": "alba",
+    "french_24l": "estelle",
+    "german": "juergen",
+    "italian": "giovanni",
+    "portuguese": "rafael",
+    "spanish": "lola",
+}
+
+VOICES_DIR = Path(__file__).parent / "voices"
+VOICE_WAV = VOICES_DIR / "clone_voice.wav"
 
 SAMPLE_RATE = 16000
 MAX_RECORD_SECONDS = 30
@@ -71,29 +109,80 @@ MIN_CHUNK_CHARS = 15
 # Max chunk size (forces a split even without punctuation)
 MAX_CHUNK_CHARS = 200
 
+# ── Language helpers ────────────────────────────────────────────────────
+
+def tts_language_for(lang_code: str) -> str:
+    """Pocket-TTS config name for a whisper language code."""
+    return LANGUAGES[lang_code][0]
+
+def language_name(lang_code: str) -> str:
+    return LANGUAGES[lang_code][1]
+
+def voice_safetensors_for(tts_lang: str) -> Path:
+    """Cloned voice states are encoded by the loaded model, so each language needs its own."""
+    return VOICES_DIR / f"clone_voice.{tts_lang}.safetensors"
+
+def resolve_language(detected: str) -> str:
+    """Map a detected whisper code onto a supported language, falling back to the default."""
+    if detected in LANGUAGES:
+        return detected
+    print(
+        f"  ⚠️  Detected language '{detected}' is not supported by Pocket-TTS "
+        f"(supported: {', '.join(LANGUAGES)}) — falling back to {language_name(DEFAULT_LANGUAGE)}.",
+        flush=True,
+    )
+    return DEFAULT_LANGUAGE
+
 # ── TTS ─────────────────────────────────────────────────────────────────
 
 _tts_model = None
 _tts_voice_state = None
+_tts_language = None  # Pocket-TTS config name currently loaded
 
-def init_tts():
-    global _tts_model, _tts_voice_state
-    print("🔊 Loading Pocket-TTS model...", flush=True)
-    _tts_model = TTSModel.load_model()
+def _resolve_voice_state(tts_lang: str):
+    """Cloned state for this language if we have one, else clone it, else a preset voice."""
+    cached = voice_safetensors_for(tts_lang)
 
-    if os.path.exists(VOICE_SAFETENSORS):
-        print(f"🔊 Loading cloned voice from safetensors...", flush=True)
-        _tts_voice_state = _tts_model.get_state_for_audio_prompt(VOICE_SAFETENSORS)
-        print("🔊 TTS ready (cloned voice).", flush=True)
-    elif os.path.exists(VOICE_WAV):
-        print(f"🔊 Exporting voice from wav...", flush=True)
-        _tts_voice_state = _tts_model.get_state_for_audio_prompt(VOICE_WAV)
-        export_model_state(_tts_voice_state, VOICE_SAFETENSORS)
-        print("🔊 TTS ready (cloned voice).", flush=True)
-    else:
-        print(f"🔊 Using preset '{TTS_VOICE_FALLBACK}'...", flush=True)
-        _tts_voice_state = _tts_model.get_state_for_audio_prompt(TTS_VOICE_FALLBACK)
-        print("🔊 TTS ready (preset voice).", flush=True)
+    if cached.exists():
+        print(f"🔊 Loading cloned voice ({tts_lang}) from safetensors...", flush=True)
+        return _tts_model.get_state_for_audio_prompt(str(cached))
+
+    preset = PRESET_VOICE[tts_lang]
+
+    if not VOICE_WAV.exists():
+        print(f"🔊 No {VOICE_WAV.name} found — using preset voice '{preset}'.", flush=True)
+        return _tts_model.get_state_for_audio_prompt(preset)
+
+    # Cloning needs the gated kyutai/pocket-tts weights. Without an HF login, Pocket-TTS
+    # silently falls back to the no-cloning weights, and only fails when we clone.
+    if not _tts_model.has_voice_cloning:
+        print(
+            f"  ⚠️  Voice cloning weights unavailable for {tts_lang} — using preset '{preset}'.\n"
+            f"      Accept the terms at https://huggingface.co/kyutai/pocket-tts and run "
+            f"`uvx hf auth login`, then re-run to clone your voice into this language.",
+            flush=True,
+        )
+        return _tts_model.get_state_for_audio_prompt(preset)
+
+    print(f"🔊 Exporting cloned voice for {tts_lang} from wav...", flush=True)
+    state = _tts_model.get_state_for_audio_prompt(str(VOICE_WAV))
+    export_model_state(state, str(cached))
+    return state
+
+def init_tts(lang_code: str):
+    """Load the Pocket-TTS weights for a language. No-op if already loaded."""
+    global _tts_model, _tts_voice_state, _tts_language
+
+    tts_lang = tts_language_for(lang_code)
+    if _tts_language == tts_lang:
+        return
+
+    t0 = time.time()
+    print(f"🔊 Loading Pocket-TTS model ({tts_lang})...", flush=True)
+    _tts_model = TTSModel.load_model(language=tts_lang)
+    _tts_language = tts_lang
+    _tts_voice_state = _resolve_voice_state(tts_lang)
+    print(f"🔊 TTS ready — {language_name(lang_code)} ({time.time() - t0:.1f}s).", flush=True)
 
 def generate_speech_chunk(text: str) -> np.ndarray:
     """Generate audio for a text chunk. Runs in a thread."""
@@ -143,16 +232,29 @@ def chunk_sentences(text_stream, on_chunk=None):
 # ── LLM streaming ───────────────────────────────────────────────────────
 
 _ollama_context = []
+_ollama_context_lang = None
 
-def stream_llm(prompt: str):
+def system_prompt_for(lang_code: str) -> str:
+    """Small models drift back to English mid-conversation without an explicit instruction."""
+    return f"{SYSTEM_PROMPT} Always reply in {language_name(lang_code)}."
+
+def stream_llm(prompt: str, lang_code: str):
     """
     Stream LLM tokens from Ollama. Yields token strings.
     Updates _ollama_context with the final context.
     """
+    global _ollama_context_lang
+
+    # The system prompt is baked into the context on the first call, so a language change
+    # (e.g. a typed English turn followed by a spoken German one) needs a fresh context.
+    if _ollama_context_lang != lang_code:
+        _ollama_context.clear()
+        _ollama_context_lang = lang_code
+
     payload = json.dumps({
         "model": OLLAMA_MODEL,
         "prompt": prompt,
-        "system": SYSTEM_PROMPT,
+        "system": system_prompt_for(lang_code),
         "stream": True,
         "context": _ollama_context,
         "options": {
@@ -188,23 +290,15 @@ def stream_llm(prompt: str):
                     _ollama_context.extend(ctx)
                 break
 
-def chat_streaming(prompt: str):
+def speak_stream(sentence_stream, t0=None):
     """
-    Stream LLM output, chunk into sentences, generate TTS in parallel.
-    Plays audio chunks as they're ready — first sentence starts speaking
-    while LLM is still generating the rest.
+    Generate TTS for each sentence chunk in a worker thread and play chunks as they
+    become ready, so audio starts before the text stream has finished.
     """
-    t0 = time.time()
+    if t0 is None:
+        t0 = time.time()
     first_audio_played = False
 
-    # Create a token generator
-    token_stream = stream_llm(prompt)
-
-    # Chunk tokens into sentences
-    sentence_stream = chunk_sentences(token_stream)
-
-    # Pipeline: for each sentence chunk, generate TTS in a worker thread
-    # while continuing to consume the LLM stream
     audio_queue = queue.Queue(maxsize=4)  # limit backlog
 
     def tts_worker():
@@ -255,6 +349,17 @@ def chat_streaming(prompt: str):
 
     return full_text.strip()
 
+def chat_streaming(prompt: str, lang_code: str):
+    """
+    Stream LLM output, chunk into sentences, generate TTS in parallel.
+    Plays audio chunks as they're ready — first sentence starts speaking
+    while LLM is still generating the rest.
+    """
+    t0 = time.time()
+    token_stream = stream_llm(prompt, lang_code)
+    sentence_stream = chunk_sentences(token_stream)
+    return speak_stream(sentence_stream, t0)
+
 # ── STT ────────────────────────────────────────────────────────────────
 
 def write_temp_wav(audio: np.ndarray) -> str:
@@ -301,23 +406,52 @@ def record_audio() -> str:
 
     return write_temp_wav(audio)
 
-def transcribe(audio_path: str) -> str:
+def transcribe(audio_path: str, language: str = "auto"):
+    """
+    Transcribe an audio file. `language` is a whisper code, or "auto" to detect.
+    Returns (text, detected_language_code).
+    """
     cmd = [
         WHISPER_CLI,
         "-m", WHISPER_MODEL,
         "-f", audio_path,
-        "--language", "en",
+        "--language", language,
         "-nt",
         "-np",
+        "-oj",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    os.unlink(audio_path)
+    subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
-    text = result.stdout.strip()
-    lines = [l for l in text.split("\n") if l.strip() and not l.startswith("whisper_")]
-    return " ".join(lines).strip()
+    # whisper.cpp writes the JSON result alongside the input file.
+    json_path = audio_path + ".json"
+    text, detected = "", language
+
+    try:
+        with open(json_path) as f:
+            data = json.load(f)
+        # "params.language" echoes the request ("auto"); the detection is in "result.language".
+        detected = data.get("result", {}).get("language", language)
+        text = " ".join(
+            seg.get("text", "") for seg in data.get("transcription", [])
+        ).strip()
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"  ⚠️  Could not read whisper output: {e}", flush=True)
+    finally:
+        for path in (json_path, audio_path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    return text, detected
 
 # ── Main ───────────────────────────────────────────────────────────────
+
+def speak_once(lang_code: str, text: str):
+    """Non-interactive smoke test: speak text in a language, no mic and no LLM."""
+    init_tts(lang_code)
+    print(f"  💬 Speaking {language_name(lang_code)}: \"{text}\"", flush=True)
+    speak_stream(chunk_sentences(iter([text])))
 
 def ensure_ollama():
     try:
@@ -352,64 +486,114 @@ def banner(hands_free: bool):
     print("╚" + "═" * BANNER_WIDTH + "╝")
     print()
 
-def next_prompt_hands_free(listener) -> str | None:
+def next_prompt_hands_free(listener, language: str):
     """Capture one spoken turn and transcribe it. None means 'nothing usable'."""
     audio = listener.listen()
     if audio is None:
         return None
 
     t0 = time.time()
-    text = transcribe(write_temp_wav(audio))
+    text, detected = transcribe(write_temp_wav(audio), language)
     print(f"  📝 STT ({time.time() - t0:.2f}s): \"{text}\"", flush=True)
-    return text or None
+    if not text:
+        return None
+    return text, detected
 
-def next_prompt_push_to_talk(turn: int) -> str | None:
+def next_prompt_push_to_talk(turn: int, language: str):
     """Legacy path: Enter to record, Enter again to stop. Typed text also works."""
     typed = input(f"\n[{turn}] Press Enter to record (or type 'quit'): ").strip()
     if is_quit(typed):
-        return "__quit__"
+        return "__quit__", None
     if typed:
-        return typed
+        # Typed input carries no audio, so there is nothing to detect a language from.
+        return typed, None
 
     audio_path = record_audio()
     if not audio_path:
         return None
 
     t0 = time.time()
-    text = transcribe(audio_path)
+    text, detected = transcribe(audio_path, language)
     print(f"  📝 STT ({time.time() - t0:.2f}s): \"{text}\"", flush=True)
     if not text:
+        # Don't lock the session to a language guessed from silence or noise.
         print("  (empty transcript, skipping)")
         return None
-    return text
+    return text, detected
 
 def main():
-    hands_free = "--push-to-talk" not in sys.argv
+    parser = argparse.ArgumentParser(description="Local streaming voice chat.")
+    parser.add_argument(
+        "--push-to-talk",
+        action="store_true",
+        help="Press Enter to start/stop recording instead of hands-free turn detection.",
+    )
+    parser.add_argument(
+        "--lang",
+        choices=sorted(LANGUAGES),
+        help="Pin the language instead of detecting it from the first utterance.",
+    )
+    parser.add_argument(
+        "--text",
+        help="Speak this text and exit (smoke test). Requires --lang.",
+    )
+    args = parser.parse_args()
+
+    if args.text:
+        if not args.lang:
+            parser.error("--text requires --lang")
+        speak_once(args.lang, args.text)
+        return
+
+    hands_free = not args.push_to_talk
     banner(hands_free)
 
-    init_tts()
+    # Language is locked for the session because switching means reloading TTS weights.
+    session_lang = args.lang
+    if session_lang:
+        print(f"🌍 Language pinned to {language_name(session_lang)}.", flush=True)
+    else:
+        print("🌍 Language will be detected from your first utterance.", flush=True)
+    print(f"🧠 LLM: {OLLAMA_MODEL} (all languages)", flush=True)
+    print(f"📝 STT: {os.path.basename(WHISPER_MODEL)}", flush=True)
+
+    # Load English up front so English sessions start speaking immediately; a different
+    # detected language swaps the model once, on the first turn.
+    init_tts(session_lang or DEFAULT_LANGUAGE)
     listener = TurnListener() if hands_free else None
     ensure_ollama()
 
     turn = 0
     while True:
         try:
+            language = session_lang or "auto"
             if hands_free:
-                user_text = next_prompt_hands_free(listener)
+                prompt = next_prompt_hands_free(listener, language)
             else:
-                user_text = next_prompt_push_to_talk(turn)
+                prompt = next_prompt_push_to_talk(turn, language)
 
-            if user_text is None:
+            if prompt is None:
                 continue
+            user_text, detected = prompt
             if user_text == "__quit__" or is_quit(user_text):
                 print("👋 Bye!")
                 break
 
+            # `detected` is None for typed input, which leaves the session unlocked.
+            if session_lang is None and detected is not None:
+                session_lang = resolve_language(detected)
+                print(
+                    f"  🌍 Detected {language_name(session_lang)} — locked for this session.",
+                    flush=True,
+                )
+                init_tts(session_lang)
+            turn_lang = session_lang or DEFAULT_LANGUAGE
+
             # Stream LLM → chunk → TTS (plays while generating).
             # In hands-free mode the mic is already closed, so this can't
             # hear itself.
-            print("  🧠 Thinking + speaking...", flush=True)
-            chat_streaming(user_text)
+            print(f"  🧠 Thinking + speaking [{OLLAMA_MODEL}]...", flush=True)
+            chat_streaming(user_text, turn_lang)
 
             turn += 1
 
