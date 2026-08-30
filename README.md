@@ -4,7 +4,7 @@ Fully offline voice chat pipeline running on Apple Silicon (M4 Mac mini). No API
 
 - **Turn taking:** [Silero VAD](https://github.com/snakers4/silero-vad) + [Smart Turn v3](https://huggingface.co/pipecat-ai/smart-turn-v3) — hands-free, ~15ms CPU
 - **STT:** [whisper.cpp](https://github.com/ggerganov/whisper.cpp) (Metal-accelerated) — ~0.3s for short utterances
-- **LLM:** [Ollama](https://ollama.com) (qwen2.5:7b) — ~50 tok/s warm, all six languages
+- **LLM:** [Ollama](https://ollama.com) (qwen2.5:7b default, swappable via `--model`) — ~50 tok/s warm, all six languages
 - **TTS:** [Pocket-TTS](https://github.com/kyutai-labs/pocket-tts) — 6x realtime, 200ms to first audio, voice cloning
 
 **Total round-trip latency: ~700ms–1s** for a short exchange.
@@ -26,6 +26,10 @@ curl -L -o ~/.local/share/whisper-cpp/ggml-base.bin \
 # 3. Ollama + models
 brew install ollama  # or download from ollama.com
 ollama pull qwen2.5:7b    # 4.7GB — handles all six languages
+# Optional: llama3.2:3b (2GB, fastest, fits in 16GB)
+ollama pull llama3.2:3b
+# Optional (48GB+ RAM): PhoneLLM — purpose-built for voice agents
+ollama pull hf.co/EryriLabs/phonellm-alpha-1-GGUF:Q8_0  # ~34GB
 
 # 4. HuggingFace auth — the voice cloning weights are gated
 #    a) Accept the terms at: https://huggingface.co/kyutai/pocket-tts
@@ -161,7 +165,21 @@ uvx pocket-tts generate --voice ./voices/your_voice.safetensors --text "Hello wo
 ```bash
 uv run voice_chat.py                 # hands-free (default)
 uv run voice_chat.py --push-to-talk  # Enter to start, Enter to stop
+uv run voice_chat.py --model phonellm  # pick the LLM (see below)
 ```
+
+### Choosing the LLM
+
+`--model` takes a preset name or any raw Ollama model id:
+
+| Preset | Model | Notes |
+|--------|-------|-------|
+| `qwen` (default) | `qwen2.5:7b` | Handles all six languages with one set of weights |
+| `llama` | `llama3.2:3b` | Fastest, fits in 16GB; English-leaning |
+| `phonellm` | [PhoneLLM Alpha 1](https://huggingface.co/pipecat-ai/phonellm-alpha-1) Q8_0 | Voice-agent fine-tune of Nemotron 3 Nano 30B-A3B (MoE, 3.5B active). Best conversational quality + tool calling; needs 48GB+ RAM. Runs at temperature 0, thinking off, per the model card |
+
+Presets carry model-specific Ollama options (temperature, thinking), so
+switching models is just the flag — no code edits.
 
 Hands-free:
 
@@ -214,7 +232,7 @@ Edit `voice_chat.py` to change:
 
 | Setting | Default | Options |
 |---------|---------|---------|
-| `OLLAMA_MODEL` | `qwen2.5:7b` | Any Ollama model that speaks your languages |
+| `MODEL_PRESETS` | `qwen`, `llama`, `phonellm` | Add presets here; select at runtime with `--model` |
 | `WHISPER_MODEL` | `ggml-base.bin` | `ggml-small.bin` (better non-English, ~2x slower) |
 | `LANGUAGES` | 6 languages | Maps whisper codes → Pocket-TTS models; swap `german` for `german_24l` etc. |
 | `PRESET_VOICE` | per-language | Fallback voice when no clone is available |

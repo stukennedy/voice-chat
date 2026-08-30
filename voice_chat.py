@@ -3,7 +3,7 @@
 # Components:
 #   1. Turn:  Silero VAD + Smart Turn v3 — hands-free end-of-turn detection
 #   2. STT:   whisper.cpp (Metal-accelerated) via subprocess — multilingual
-#   3. LLM:   Ollama (qwen2.5:7b) — streamed token-by-token
+#   3. LLM:   Ollama (qwen2.5:7b default; presets via --model) — streamed token-by-token
 #   4. TTS:   Pocket-TTS — sentence-chunked streaming, plays while LLM still generates
 #
 # Pipeline: mic -> vad + smart-turn -> whisper.cpp -> ollama (stream)
@@ -21,6 +21,7 @@
 #   uv run voice_chat.py --push-to-talk         # press Enter to start/stop recording
 #   uv run voice_chat.py --lang de              # pinned to German
 #   uv run voice_chat.py --lang de --text "..." # non-interactive smoke test (no mic, no LLM)
+#   uv run voice_chat.py --model phonellm       # pick an LLM preset (see MODEL_PRESETS)
 #
 # First run per language: exports voice state from voices/clone_voice.wav
 #   -> voices/clone_voice.<language>.safetensors
@@ -57,10 +58,42 @@ WHISPER_CLI = "/opt/homebrew/bin/whisper-cli"
 WHISPER_MODEL = os.path.expanduser("~/.local/share/whisper-cpp/ggml-base.bin")
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
-# One model for every language. A 3B model is faster per token, but only the first sentence
-# is latency-critical (after that, playback is slower than generation), and the gap there is
-# ~80ms — not worth evicting and reloading gigabytes of weights on a language switch.
-OLLAMA_MODEL = "qwen2.5:7b"
+# LLM presets — select with `--model <name>`. An unknown name is passed
+# straight through to Ollama as a model id, with the default options.
+# "think" is only sent when a preset sets it: Ollama rejects the field
+# for models without thinking support.
+MODEL_PRESETS = {
+    "qwen": {
+        # Default: one model for every language. A 3B model is faster per token, but only
+        # the first sentence is latency-critical (after that, playback is slower than
+        # generation), and the gap there is ~80ms — not worth evicting and reloading
+        # gigabytes of weights on a language switch.
+        "model": "qwen2.5:7b",
+        "options": {"temperature": 0.7, "num_predict": 200},
+    },
+    "llama": {
+        # Fastest; fits alongside everything else in 16GB.
+        "model": "llama3.2:3b",
+        "options": {"temperature": 0.7, "num_predict": 200},
+    },
+    "phonellm": {
+        # Pipecat's voice-agent fine-tune of Nemotron 3 Nano 30B-A3B (MoE,
+        # 3.5B active). Q8_0 is ~34GB — needs 48GB+ unified memory.
+        # Trained for temperature 0 with thinking disabled.
+        "model": "hf.co/EryriLabs/phonellm-alpha-1-GGUF:Q8_0",
+        "options": {"temperature": 0, "num_predict": 200},
+        "think": False,
+    },
+}
+DEFAULT_MODEL = "qwen"
+
+# Active model config, set from --model in main()
+_llm = MODEL_PRESETS[DEFAULT_MODEL]
+
+def resolve_model(name: str) -> dict:
+    if name in MODEL_PRESETS:
+        return MODEL_PRESETS[name]
+    return {"model": name, "options": {"temperature": 0.7, "num_predict": 200}}
 
 # Whisper ISO code -> (Pocket-TTS config name, human-readable name)
 # Pocket-TTS has 6-layer and 24-layer variants of most languages; the 6-layer ones are
@@ -333,17 +366,17 @@ def stream_llm(prompt: str, lang_code: str):
         _ollama_context.clear()
         _ollama_context_lang = lang_code
 
-    payload = json.dumps({
-        "model": OLLAMA_MODEL,
+    body = {
+        "model": _llm["model"],
         "prompt": prompt,
         "system": system_prompt_for(lang_code),
         "stream": True,
         "context": _ollama_context,
-        "options": {
-            "temperature": 0.7,
-            "num_predict": 200,
-        }
-    }).encode()
+        "options": _llm["options"],
+    }
+    if "think" in _llm:
+        body["think"] = _llm["think"]
+    payload = json.dumps(body).encode()
 
     req = urllib.request.Request(
         OLLAMA_URL,
@@ -605,6 +638,8 @@ def next_prompt_push_to_talk(turn: int, language: str):
     return text, detected
 
 def main():
+    global _llm
+
     parser = argparse.ArgumentParser(description="Local streaming voice chat.")
     parser.add_argument(
         "--push-to-talk",
@@ -620,7 +655,14 @@ def main():
         "--text",
         help="Speak this text and exit (smoke test). Requires --lang.",
     )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"LLM preset ({', '.join(MODEL_PRESETS)}) or any Ollama model id.",
+    )
     args = parser.parse_args()
+
+    _llm = resolve_model(args.model)
 
     if args.text:
         if not args.lang:
@@ -637,7 +679,7 @@ def main():
         print(f"🌍 Language pinned to {language_name(session_lang)}.", flush=True)
     else:
         print("🌍 Language will be detected from your first utterance.", flush=True)
-    print(f"🧠 LLM: {OLLAMA_MODEL} (all languages)", flush=True)
+    print(f"🧠 LLM: {_llm['model']}", flush=True)
     print(f"📝 STT: {os.path.basename(WHISPER_MODEL)}", flush=True)
 
     # Load English up front so English sessions start speaking immediately; a different
@@ -675,7 +717,7 @@ def main():
             # Stream LLM → chunk → TTS (plays while generating).
             # In hands-free mode the mic is already closed, so this can't
             # hear itself.
-            print(f"  🧠 Thinking + speaking [{OLLAMA_MODEL}]...", flush=True)
+            print(f"  🧠 Thinking + speaking [{_llm['model']}]...", flush=True)
             chat_streaming(user_text, turn_lang)
 
             turn += 1
