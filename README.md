@@ -163,7 +163,8 @@ uvx pocket-tts generate --voice ./voices/your_voice.safetensors --text "Hello wo
 ## Run
 
 ```bash
-uv run voice_chat.py                 # hands-free (default)
+uv run voice_chat.py                 # hands-free, talk over it to interrupt (default)
+uv run voice_chat.py --no-barge-in   # hands-free, mic closed while it speaks
 uv run voice_chat.py --push-to-talk  # Enter to start, Enter to stop
 uv run voice_chat.py --model phonellm  # pick the LLM (see below)
 ```
@@ -191,7 +192,8 @@ Hands-free:
 4. On the first turn the language is locked, and its TTS model loaded if it isn't already
 5. qwen2.5:7b generates a response, instructed to reply in that language (~500ms)
 6. Pocket-TTS speaks the response in the cloned voice (~200ms to first audio)
-7. Audio plays through speakers, mic closed
+7. Audio plays through speakers; the mic stays open, so talking over it stops it
+   (see [Barge-in](#barge-in))
 8. Say "goodbye" (or Ctrl-C) to exit
 
 Push-to-talk follows the same flow, with Enter to start and stop recording instead of
@@ -211,9 +213,30 @@ end of a turn look identical to a VAD. Smart Turn scores the first around 0.01
 and the second around 0.97, so you don't get interrupted mid-thought and you
 don't wait out a fixed timeout when you're plainly done.
 
-Turn taking is **half-duplex** — the mic stream is closed while the bot speaks.
-That rules out barge-in, but it also means TTS output can never be fed back
-into the detector, so no echo cancellation is needed and speakers work fine.
+### Barge-in
+
+Hands-free mode is **full-duplex**: the mic stays open while the bot speaks, so
+you can cut it off mid-sentence. It stops within about half a second, your
+interruption becomes the next turn, and the LLM is told how much of its reply
+you actually heard.
+
+An open mic next to a speaker hears the bot, so `duplex_audio.py` runs mic and
+speaker through one CoreAudio stream and WebRTC's echo canceller (via
+`livekit`) subtracts the bot's voice before VAD and whisper see it. While the
+bot holds the floor, a turn needs ~256ms of sustained speech to start, so
+whatever echo is left can't trigger it.
+
+It works best with **headphones**, or with speakers at a moderate volume and
+you closer to the mic than they are. When your voice and the bot's overlap, the
+canceller has to suppress echo without suppressing you. In simulated rooms that
+held up when you were ~10dB louder at the mic than the bot (90%+ of your speech
+still detected); when both were equally loud, interruptions were missed. The
+canceller also needs about a second of the bot's speech to learn the room, so
+barge-in is off until then.
+
+`--no-barge-in` (and `--push-to-talk`) are **half-duplex**: the mic stream is
+closed while the bot speaks, so TTS output can never reach the detector and no
+echo cancellation is involved.
 
 Tunables live at the top of `turn_taking.py`:
 
@@ -225,6 +248,8 @@ Tunables live at the top of `turn_taking.py`:
 | `SMART_TURN_THRESHOLD` | `0.5` | Raise to interrupt less, lower to respond faster |
 | `VAD_THRESHOLD` | `0.5` | Raise in a noisy room |
 | `PREROLL_SECONDS` | `0.3` | Audio kept from before speech onset, so word one isn't clipped |
+| `BARGE_IN_START_FRAMES` | `8` | Frames of speech (32ms each) needed to interrupt the bot |
+| `BARGE_IN_MIN_TURN_MS` | `1000` | An interruption can't end sooner, so overlap dropouts don't split it |
 
 ## Configuration
 
@@ -286,11 +311,15 @@ The LLM's output is split into chunks and spoken as it streams. Two details matt
   length — seconds of silence punched into a multi-chunk response. Writing into a single
   persistent stream brings that to ~0.04s total. `drain_playback()` then waits out the
   device latency before the mic reopens, which is what keeps half-duplex honest.
+  Barge-in mode plays through `DuplexAudio` instead, which can drop queued audio
+  the moment you interrupt.
 
 ## Architecture
 
 ```
-mic → sounddevice (16kHz) → Silero VAD (32ms frames)
+mic + speaker → one 48kHz stream → WebRTC echo canceller → 16kHz
+                                  ↓
+                            Silero VAD (32ms frames) ── speech while bot talks → stop playback
                                   ↓ silence
                             Smart Turn v3 (ONNX) → turn complete?
                                   ↓ yes
@@ -299,7 +328,7 @@ mic → sounddevice (16kHz) → Silero VAD (32ms frames)
                             language locked for session
                                   ↓
   speaker ← Pocket-TTS (CPU, 24kHz, per-language model) ← Ollama (qwen2.5:7b)
-     (mic closed while speaking — half-duplex)
+     (mic stays open; --no-barge-in closes it while speaking)
 ```
 
 All processing is local. No network calls except Ollama on localhost:11434.

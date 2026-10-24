@@ -9,8 +9,10 @@
 # Pipeline: mic -> vad + smart-turn -> whisper.cpp -> ollama (stream)
 #           -> sentence buffer -> pocket-tts -> speaker
 #
-# Turn taking is half-duplex: the mic closes while the bot speaks, so there is
-# no barge-in and no echo. See turn_taking.py.
+# Hands-free turn taking is full-duplex: the mic stays open while the bot speaks,
+# with echo cancellation, so you can talk over it to interrupt (barge-in). See
+# duplex_audio.py. --no-barge-in and --push-to-talk are half-duplex: the mic is
+# closed while the bot speaks.
 #
 # Languages: english, french, german, italian, portuguese, spanish.
 # Pocket-TTS ships one set of weights per language, so the language is detected from
@@ -22,6 +24,7 @@
 #   uv run voice_chat.py --lang de              # pinned to German
 #   uv run voice_chat.py --lang de --text "..." # non-interactive smoke test (no mic, no LLM)
 #   uv run voice_chat.py --model phonellm       # pick an LLM preset (see MODEL_PRESETS)
+#   uv run voice_chat.py --no-barge-in          # mic closed while the bot speaks
 #
 # First run per language: exports voice state from voices/clone_voice.wav
 #   -> voices/clone_voice.<language>.safetensors
@@ -48,7 +51,8 @@ import sounddevice as sd
 from scipy.io.wavfile import write as wav_write
 from pocket_tts import TTSModel, export_model_state
 
-from turn_taking import TurnListener
+from duplex_audio import DuplexAudio
+from turn_taking import VAD_FRAME, DuplexTurnListener, TurnListener
 
 # ── Config ──────────────────────────────────────────────────────────────
 
@@ -230,7 +234,8 @@ def init_tts(lang_code: str):
     _tts_voice_state = _resolve_voice_state(tts_lang)
     # Open the output stream now so CoreAudio spins up here rather than stalling the
     # first chunk of the first response.
-    _output(_tts_model.sample_rate)
+    if _duplex is None:
+        _output(_tts_model.sample_rate)
     print(f"🔊 TTS ready — {language_name(lang_code)} ({time.time() - t0:.1f}s).", flush=True)
 
 def normalize_chunk(audio: np.ndarray) -> np.ndarray:
@@ -271,6 +276,7 @@ def generate_speech_chunk(text: str) -> np.ndarray:
     return normalize_chunk(trim_silence(audio))
 
 _output_stream = None
+_duplex: DuplexAudio | None = None  # set in barge-in mode, replaces _output_stream
 
 def _output(sample_rate: int):
     """
@@ -293,18 +299,38 @@ def _output(sample_rate: int):
 
 def play_audio(audio_np: np.ndarray):
     """Queue a chunk for gapless playback."""
-    _output(_tts_model.sample_rate).write(audio_np)
+    if _duplex is not None:
+        _duplex.play(audio_np, _tts_model.sample_rate)
+    else:
+        _output(_tts_model.sample_rate).write(audio_np)
 
-def drain_playback():
+def playback_position() -> int:
+    return _duplex.queued_samples if _duplex is not None else 0
+
+def stop_playback() -> int:
+    """Cut speech off now. Returns how far playback got, comparable to playback_position()."""
+    played = _duplex.played_samples
+    _duplex.stop()
+    return played
+
+def drain_playback(interrupted: threading.Event | None = None) -> bool:
     """
-    Block until queued audio has actually been heard.
+    Block until queued audio has actually been heard. Returns False if
+    `interrupted` was set first.
 
     Half-duplex turn taking depends on this: the mic reopens as soon as the response
     returns, and write() hands audio to the device rather than waiting for it to play.
     Without this the VAD would hear the tail of the bot's own speech.
     """
-    if _output_stream is not None:
+    if _duplex is not None:
+        while _duplex.is_playing():
+            if interrupted is not None and interrupted.is_set():
+                return False
+            time.sleep(0.02)
+        time.sleep(_duplex.output_latency)
+    elif _output_stream is not None:
         time.sleep(_output_stream.latency)
+    return True
 
 # ── Sentence chunker ────────────────────────────────────────────────────
 
@@ -405,44 +431,82 @@ def stream_llm(prompt: str, lang_code: str):
                     _ollama_context.extend(ctx)
                 break
 
-def speak_stream(sentence_stream, t0=None):
+_tts_thread: threading.Thread | None = None
+
+def wait_for_previous_response():
+    """An interrupted response keeps draining the LLM in the background; it owns the context until done."""
+    if _tts_thread is not None:
+        _tts_thread.join(timeout=60)
+
+def speak_stream(sentence_stream, t0=None, interrupted: threading.Event | None = None):
     """
     Generate TTS for each sentence chunk in a worker thread and play chunks as they
     become ready, so audio starts before the text stream has finished.
+
+    If `interrupted` is set, playback stops at once and the rest of the text is not
+    spoken. The worker still drains the text stream, so the LLM finishes the reply
+    and its conversation context stays whole.
+
+    Returns (the text the user actually heard, whether they interrupted).
     """
+    global _tts_thread
     if t0 is None:
         t0 = time.time()
     first_audio_played = False
 
     audio_queue = queue.Queue(maxsize=4)  # limit backlog
+    cancelled = threading.Event()
+
+    def put(item):
+        # Nobody reads the queue after an interruption, so a blocking put would hang.
+        while not cancelled.is_set():
+            try:
+                audio_queue.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                pass
 
     def tts_worker():
         """Generate TTS for each chunk, push audio to queue."""
-        for chunk in sentence_stream:
-            t_gen = time.time()
-            audio = generate_speech_chunk(chunk)
-            gen_time = time.time() - t_gen
-            dur = len(audio) / _tts_model.sample_rate
-            audio_queue.put((chunk, audio, gen_time, dur))
-
-        # Sentinel: signal end of stream
-        audio_queue.put(None)
+        try:
+            for chunk in sentence_stream:
+                if cancelled.is_set():
+                    continue
+                t_gen = time.time()
+                audio = generate_speech_chunk(chunk)
+                gen_time = time.time() - t_gen
+                dur = len(audio) / _tts_model.sample_rate
+                put((chunk, audio, gen_time, dur))
+        finally:
+            # Sentinel: signal end of stream
+            put(None)
 
     # Start TTS worker thread
     tts_thread = threading.Thread(target=tts_worker, daemon=True)
     tts_thread.start()
+    _tts_thread = tts_thread
+
+    def was_interrupted() -> bool:
+        return interrupted is not None and interrupted.is_set()
 
     # Main thread: play audio chunks as they arrive
     chunks_played = 0
-    full_text = ""
+    spoken = []  # (chunk, playback position where it starts)
+    deadline = time.time() + 60
 
-    while True:
-        item = audio_queue.get(timeout=60)
+    while not was_interrupted():
+        try:
+            item = audio_queue.get(timeout=0.05)
+        except queue.Empty:
+            if time.time() > deadline:
+                raise TimeoutError("no speech from TTS for 60s")
+            continue
         if item is None:
             break
+        deadline = time.time() + 60
 
         chunk, audio, gen_time, dur = item
-        full_text += chunk + " "
+        spoken.append((chunk, playback_position()))
 
         if not first_audio_played:
             total_ttfb = time.time() - t0
@@ -457,24 +521,37 @@ def speak_stream(sentence_stream, t0=None):
         play_audio(audio)
         chunks_played += 1
 
+    if was_interrupted() or not drain_playback(interrupted):
+        cancelled.set()
+        played = stop_playback()
+        heard = " ".join(chunk for chunk, start in spoken if start < played)
+        print(f"  ✋ Interrupted after {time.time() - t0:.2f}s — heard: \"{heard}\"", flush=True)
+        return heard, True
+
     tts_thread.join(timeout=5)
-    drain_playback()
 
     total = time.time() - t0
     print(f"  🧠 Total: {total:.2f}s, {chunks_played} chunks", flush=True)
 
-    return full_text.strip()
+    return " ".join(chunk for chunk, _ in spoken), False
 
-def chat_streaming(prompt: str, lang_code: str):
+def chat_streaming(prompt: str, lang_code: str, interrupted: threading.Event | None = None):
     """
     Stream LLM output, chunk into sentences, generate TTS in parallel.
     Plays audio chunks as they're ready — first sentence starts speaking
     while LLM is still generating the rest.
     """
+    wait_for_previous_response()
     t0 = time.time()
     token_stream = stream_llm(prompt, lang_code)
     sentence_stream = chunk_sentences(token_stream)
-    return speak_stream(sentence_stream, t0)
+    return speak_stream(sentence_stream, t0, interrupted)
+
+def interruption_note(heard: str) -> str:
+    """Prefix for the next prompt. The LLM's context holds its whole reply, not what was heard."""
+    if heard:
+        return f'(The user interrupted you. They only heard you say: "{heard}")'
+    return "(The user spoke again before you started replying.)"
 
 # ── STT ────────────────────────────────────────────────────────────────
 
@@ -583,7 +660,7 @@ def is_quit(text: str) -> bool:
 
 BANNER_WIDTH = 56
 
-def banner(hands_free: bool):
+def banner(hands_free: bool, barge_in: bool):
     mode = "hands-free" if hands_free else "push-to-talk"
     hint = ("Just start talking — say 'goodbye' or Ctrl-C to exit"
             if hands_free else
@@ -599,6 +676,8 @@ def banner(hands_free: bool):
     print(row(f"🦊 Local Voice Chat ({mode}, offline)", indent=3, emoji_cells=1))
     print("╠" + "═" * BANNER_WIDTH + "╣")
     print(row(hint))
+    if barge_in:
+        print(row("Talk over it to interrupt"))
     print("╚" + "═" * BANNER_WIDTH + "╝")
     print()
 
@@ -638,7 +717,7 @@ def next_prompt_push_to_talk(turn: int, language: str):
     return text, detected
 
 def main():
-    global _llm
+    global _llm, _duplex
 
     parser = argparse.ArgumentParser(description="Local streaming voice chat.")
     parser.add_argument(
@@ -656,6 +735,11 @@ def main():
         help="Speak this text and exit (smoke test). Requires --lang.",
     )
     parser.add_argument(
+        "--no-barge-in",
+        action="store_true",
+        help="Close the mic while the bot speaks (no interrupting, no echo cancellation).",
+    )
+    parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
         help=f"LLM preset ({', '.join(MODEL_PRESETS)}) or any Ollama model id.",
@@ -671,7 +755,8 @@ def main():
         return
 
     hands_free = not args.push_to_talk
-    banner(hands_free)
+    barge_in = hands_free and not args.no_barge_in
+    banner(hands_free, barge_in)
 
     # Language is locked for the session because switching means reloading TTS weights.
     session_lang = args.lang
@@ -684,11 +769,18 @@ def main():
 
     # Load English up front so English sessions start speaking immediately; a different
     # detected language swaps the model once, on the first turn.
+    if barge_in:
+        _duplex = DuplexAudio(VAD_FRAME)
     init_tts(session_lang or DEFAULT_LANGUAGE)
-    listener = TurnListener() if hands_free else None
+    if barge_in:
+        listener = DuplexTurnListener(_duplex)
+        _duplex.start()
+    else:
+        listener = TurnListener() if hands_free else None
     ensure_ollama()
 
     turn = 0
+    note = ""  # set when the user cut the last reply short
     while True:
         try:
             language = session_lang or "auto"
@@ -715,10 +807,13 @@ def main():
             turn_lang = session_lang or DEFAULT_LANGUAGE
 
             # Stream LLM → chunk → TTS (plays while generating).
-            # In hands-free mode the mic is already closed, so this can't
-            # hear itself.
             print(f"  🧠 Thinking + speaking [{_llm['model']}]...", flush=True)
-            chat_streaming(user_text, turn_lang)
+            heard, cut_short = chat_streaming(
+                f"{note} {user_text}".strip(),
+                turn_lang,
+                interrupted=listener.barge_in if barge_in else None,
+            )
+            note = interruption_note(heard) if cut_short else ""
 
             turn += 1
 
