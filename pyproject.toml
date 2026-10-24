@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "hf>=1.28.0",
     "huggingface-hub>=1.28.0",
+    "livekit>=1.1.21",
     "numpy>=2.5.2",
     "onnxruntime>=1.29.0",
     "pocket-tts>=3.0.2",
@@ -15,3 +16,12 @@ dependencies = [
     "sounddevice>=0.5.6",
     "transformers>=5.16.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

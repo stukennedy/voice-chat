@@ -8,10 +8,13 @@
 #
 # Silero says "they stopped making noise". Smart Turn says "they stopped talking".
 #
-# Half-duplex: the mic stream is opened per turn and closed before the bot
-# speaks, so TTS output is never fed back into the detector.
+# TurnListener is half-duplex: the mic stream is opened per turn and closed
+# before the bot speaks, so TTS output is never fed back into the detector.
+# DuplexTurnListener keeps the mic open on echo-cancelled audio so the user
+# can interrupt (barge-in).
 
 import queue
+import threading
 import time
 from collections import deque
 
@@ -34,6 +37,7 @@ FRAME_MS = VAD_FRAME / SAMPLE_RATE * 1000
 VAD_THRESHOLD = 0.5        # speech probability above which a frame is speech
 SPEECH_START_FRAMES = 2    # consecutive speech frames needed to open a turn
 PREROLL_SECONDS = 0.3      # audio retained from before speech onset
+PREROLL_FRAMES = max(1, int(PREROLL_SECONDS * 1000 / FRAME_MS))
 
 SILENCE_PROBE_MS = 200     # first Smart Turn check after this much silence
 PROBE_INTERVAL_MS = 200    # re-check cadence while the silence continues
@@ -46,6 +50,22 @@ MAX_TURN_SECONDS = 30
 SETTLE_FRAMES = 3          # frames discarded after opening the stream
 KEEP_TRAILING_MS = 300     # trailing silence kept before handing audio to STT
 MIN_SPEECH_MS = 250        # turns with less real speech than this are noise, not words
+
+# While the bot is talking, a turn needs more sustained speech to start, because
+# whatever the echo canceller leaves behind must not cut the bot off. Measured on
+# simulated rooms: residual bot echo never held VAD >= 0.5 for a single frame once
+# the canceller had converged, while a user ~10dB louder than the echo did >90%.
+BARGE_IN_START_FRAMES = 8  # ~256ms
+# The opening words of an interruption overlap the bot, so the canceller mangles
+# them and VAD only fires part-way in. Hand whisper more of what came before.
+BARGE_IN_PREROLL_FRAMES = int(1000 / FRAME_MS)
+# ...and VAD drops out across that mangled stretch, which would otherwise read as
+# the end of the turn and split one interruption into a fragment and the rest.
+BARGE_IN_MIN_TURN_MS = 1000
+
+# Silero's recurrent state drifts on a long unbroken stream: 30s after a reset it
+# scored a short "Goodbye." 3 frames shorter, enough to drop it as a blip.
+VAD_RESET_FRAMES = int(10_000 / FRAME_MS)
 
 # ── Smart Turn v3 ───────────────────────────────────────────────────────
 
@@ -109,10 +129,14 @@ class TurnBuilder:
         self._is_speech_prob = speech_probability
         self._smart_turn = smart_turn
         self.verbose = verbose
+        self.start_frames = SPEECH_START_FRAMES
+        self.preroll_frames = PREROLL_FRAMES
+        self.min_turn_ms = 0
+        self.on_speech_start = None
         self.reset()
 
     def reset(self):
-        self._preroll = deque(maxlen=max(1, int(PREROLL_SECONDS * 1000 / FRAME_MS)))
+        self._preroll = deque(maxlen=BARGE_IN_PREROLL_FRAMES)
         self._turn: list[np.ndarray] = []
         self._speech_run = 0
         self.speaking = False
@@ -120,6 +144,7 @@ class TurnBuilder:
         self._next_probe = SILENCE_PROBE_MS
         self._speech_ms = 0.0
         self._probes = 0
+        self._hold_ms = 0.0
 
     def feed(self, frame: np.ndarray) -> np.ndarray | None:
         is_speech = self._is_speech_prob(frame) >= VAD_THRESHOLD
@@ -128,21 +153,28 @@ class TurnBuilder:
             # Hold a rolling pre-roll so the first word isn't clipped
             self._preroll.append(frame)
             self._speech_run = self._speech_run + 1 if is_speech else 0
-            if self._speech_run >= SPEECH_START_FRAMES:
+            if self._speech_run >= self.start_frames:
                 self.speaking = True
-                self._turn = list(self._preroll)
+                self._turn = list(self._preroll)[-self.preroll_frames:]
+                self._hold_ms = self.min_turn_ms
+                self._speech_ms = self._speech_run * FRAME_MS
                 self.silence_ms, self._next_probe = 0.0, SILENCE_PROBE_MS
                 if self.verbose:
                     print("  🗣️  Speech detected", flush=True)
+                if self.on_speech_start:
+                    self.on_speech_start()
             return None
 
         self._turn.append(frame)
+        self._hold_ms -= FRAME_MS
 
         if is_speech:
             self._speech_ms += FRAME_MS
             self.silence_ms, self._next_probe = 0.0, SILENCE_PROBE_MS
         else:
             self.silence_ms += FRAME_MS
+            if self._hold_ms > 0:
+                return None
 
             if self.silence_ms >= MAX_SILENCE_MS:
                 finished = self._finish(reason=f"{self.silence_ms:.0f}ms silence timeout")
@@ -270,3 +302,69 @@ class TurnListener:
                 ):
                     print("  (nothing heard)", flush=True)
                     return None
+
+class DuplexTurnListener(TurnListener):
+    """
+    Full-duplex capture for barge-in. The mic never closes: a background thread
+    runs turn detection over echo-cancelled frames from DuplexAudio, including
+    while the bot is speaking.
+
+    After listen() hands back a turn, the bot owns the floor until the next
+    listen() call. Speech that starts in that window sets `barge_in`, and the
+    interrupting turn is still captured whole and returned by the next listen().
+    """
+
+    def __init__(self, audio, verbose: bool = True):
+        super().__init__(verbose)
+        self._audio = audio
+        self._turns: queue.Queue = queue.Queue()
+        self.barge_in = threading.Event()
+        self._bot_has_floor = False
+        self._floor_changed = False
+        self._builder.on_speech_start = self._speech_started
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _speech_started(self):
+        if self._bot_has_floor:
+            self.barge_in.set()
+
+    def _set_floor(self, bot: bool):
+        self._bot_has_floor = bot
+        self._builder.start_frames = BARGE_IN_START_FRAMES if bot else SPEECH_START_FRAMES
+        self._builder.preroll_frames = BARGE_IN_PREROLL_FRAMES if bot else PREROLL_FRAMES
+        self._builder.min_turn_ms = BARGE_IN_MIN_TURN_MS if bot else 0
+        self._floor_changed = True
+
+    def _run(self):
+        settle = SETTLE_FRAMES
+        since_reset = 0
+        while True:
+            frame = self._audio.frames.get()
+            if settle > 0:
+                settle -= 1
+                continue
+            if not self._builder.speaking and (self._floor_changed or since_reset >= VAD_RESET_FRAMES):
+                self._vad.reset_states()
+                self._floor_changed = False
+                since_reset = 0
+            since_reset += 1
+            # Until the canceller has heard some of the bot it can't remove it yet.
+            if self._bot_has_floor and not self._audio.echo_converged and not self._builder.speaking:
+                continue
+            audio = self._builder.feed(frame)
+            if audio is not None:
+                self._builder.reset()
+                self._turns.put(audio)
+
+    def listen(self, wait_seconds: float | None = None) -> np.ndarray | None:
+        self._set_floor(bot=False)
+        if not self._builder.speaking:
+            print("🎙️  Listening...", flush=True)
+        try:
+            audio = self._turns.get(timeout=wait_seconds)
+        except queue.Empty:
+            print("  (nothing heard)", flush=True)
+            return None
+        self.barge_in.clear()
+        self._set_floor(bot=True)
+        return audio
